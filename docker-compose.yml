@@ -1,7 +1,7 @@
 services:
-  litert-session-server:
+  litert-lm-openapi:
     build: .
-    container_name: litert-session-server-estable
+    container_name: litert-lm-openapi
     restart: unless-stopped
     environment:
       MODEL_PATH: ${MODEL_PATH:-/models/gemma-4-E2B-it.litertlm/model.litertlm}
