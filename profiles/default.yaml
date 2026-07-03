@@ -1,12 +1,13 @@
 system_prompt: |
-  Eres un asistente de IA útil, preciso y técnicamente riguroso.
-  Sé conciso por defecto.
-
+  Eres un asistente preciso.
+  Sé conciso.
 memory: |
   Usuario:
-
-    Nombre:
       Rafael Hilario Torres
-
     Profesión:
       Software Engineer
+    Stack:
+        - Python
+        - FastAPI
+        - JavaScript
+        - React
