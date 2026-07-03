@@ -14,6 +14,9 @@ class Settings:
     session_timeout: int
     max_active_conversations: int
     max_num_images: int
+    context_rollover_threshold_tokens: int
+    context_rollover_recent_messages: int
+    context_rollover_recent_token_budget: int
 
     @property
     def model_id(self) -> str:
@@ -32,4 +35,13 @@ def get_settings() -> Settings:
         session_timeout=int(os.getenv("SESSION_TIMEOUT", "1800")),
         max_active_conversations=int(os.getenv("MAX_ACTIVE_CONVERSATIONS", "1000")),
         max_num_images=int(os.getenv("MAX_NUM_IMAGES", "4")),
+        context_rollover_threshold_tokens=int(
+            os.getenv("CONTEXT_ROLLOVER_THRESHOLD_TOKENS", "3200")
+        ),
+        context_rollover_recent_messages=int(
+            os.getenv("CONTEXT_ROLLOVER_RECENT_MESSAGES", "2")
+        ),
+        context_rollover_recent_token_budget=int(
+            os.getenv("CONTEXT_ROLLOVER_RECENT_TOKEN_BUDGET", "256")
+        ),
     )

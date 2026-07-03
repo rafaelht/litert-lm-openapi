@@ -269,6 +269,7 @@ async def chat_completions(
             async with state.lock:
                 state.touch()
                 update_engine_activity()
+                await manager.prepare_for_turn(state, incremental_payload)
 
                 first_chunk = {
                     "id": completion_id,
@@ -294,6 +295,7 @@ async def chat_completions(
                         incremental_payload,
                         **send_kwargs,
                     )
+                    streamed_text_parts: list[str] = []
                     
                     while True:
                         disconnected = await raw_request.is_disconnected()
@@ -312,6 +314,7 @@ async def chat_completions(
                             text_piece = sdk_message_to_text(sdk_chunk)
                             if not text_piece:
                                 continue
+                            streamed_text_parts.append(text_piece)
 
                             payload = {
                                 "id": completion_id,
@@ -327,6 +330,12 @@ async def chat_completions(
                                 ],
                             }
                             yield _sse_data(payload)
+
+                    await manager.register_turn(
+                        state,
+                        incremental_payload,
+                        "".join(streamed_text_parts),
+                    )
                         
                 except Exception as exc:
                     logger.exception("Streaming failed for conversation %s", conversation_id)
@@ -370,6 +379,7 @@ async def chat_completions(
         state.touch()
         update_engine_activity()
         try:
+            await manager.prepare_for_turn(state, incremental_payload)
             send_kwargs = _build_method_kwargs(
                 state.conversation.send_message,
                 effective_generation_params,
@@ -382,6 +392,11 @@ async def chat_completions(
         except Exception as exc:
             logger.exception("Completion failed for conversation %s", conversation_id)
             raise HTTPException(status_code=500, detail=str(exc)) from exc
+        await manager.register_turn(
+            state,
+            incremental_payload,
+            sdk_message_to_text(sdk_response),
+        )
 
     response_text = sdk_message_to_text(sdk_response)
 

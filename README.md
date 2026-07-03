@@ -44,6 +44,22 @@ requirements.txt
 - `MAX_ACTIVE_CONVERSATIONS` (default: `1000`)
 - `MAX_NUM_IMAGES` (default: `4`, habilita entradas multimodales de imagen)
 - `MODEL_PROFILE` (default: `profiles/default.yaml`)
+- `CONTEXT_ROLLOVER_THRESHOLD_TOKENS` (default: `3200`)
+- `CONTEXT_ROLLOVER_RECENT_MESSAGES` (default: `2`, rango soportado: `1` a `3`)
+- `CONTEXT_ROLLOVER_RECENT_TOKEN_BUDGET` (default: `256`)
+
+## Rolling Context Automatico
+
+- El backend monitorea continuamente `Conversation.token_count` del SDK y proyecta los tokens del siguiente turno.
+- Mientras la conversacion se mantenga por debajo de `CONTEXT_ROLLOVER_THRESHOLD_TOKENS`, se reutiliza la misma `Conversation` y su KV cache.
+- Si se supera el umbral, `ConversationManager` ejecuta un rollover transparente:
+  - genera un resumen breve,
+  - crea una nueva `Conversation` con `Engine.create_conversation(...)`,
+  - conserva el prompt de sistema del perfil,
+  - inyecta un resumen muy corto,
+  - y rehidrata solo los ultimos N mensajes recientes sin superar `CONTEXT_ROLLOVER_RECENT_TOKEN_BUDGET`.
+- Se conserva internamente el mismo `conversation_id`, por lo que OpenWebUI no percibe el cambio.
+- El rollover emite logs con tokens antes/despues para facilitar observabilidad.
 
 ## Perfil global del modelo
 

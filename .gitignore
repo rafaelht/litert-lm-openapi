@@ -55,4 +55,5 @@ Thumbs.db
 *.litertlm
 
 #docs
+docs/
 models/
