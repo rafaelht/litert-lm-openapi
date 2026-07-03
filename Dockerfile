@@ -16,6 +16,7 @@ RUN pip install --no-cache-dir -r /app/requirements.txt
 
 # 3. Copiar el código de la aplicación
 COPY app /app/app
+COPY profiles /app/profiles
 
 EXPOSE 8000
 

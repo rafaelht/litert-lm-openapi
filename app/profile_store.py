@@ -114,9 +114,21 @@ _store_lock = asyncio.Lock()
 
 def _resolve_profile_path(raw_path: str) -> Path:
     profile_path = Path(raw_path)
-    if not profile_path.is_absolute():
-        profile_path = Path.cwd() / profile_path
-    return profile_path.resolve()
+    if profile_path.is_absolute():
+        return profile_path.resolve()
+
+    candidate_bases = [
+        Path.cwd(),
+        Path(__file__).resolve().parents[1],
+    ]
+
+    for base in candidate_bases:
+        candidate = (base / profile_path).resolve()
+        if candidate.exists():
+            return candidate
+
+    # Preserve previous behavior for error reporting while still being deterministic.
+    return (Path.cwd() / profile_path).resolve()
 
 
 def _parse_profile(raw_data: dict[str, Any], profile_path: Path) -> ModelProfile:
@@ -151,7 +163,11 @@ def _load_profile() -> ProfileStore:
     profile_path = _resolve_profile_path(settings.model_profile)
 
     if not profile_path.exists():
-        raise FileNotFoundError(f"Profile file not found: {profile_path}")
+        raise FileNotFoundError(
+            "Profile file not found: "
+            f"{profile_path}. "
+            "Set MODEL_PROFILE to an absolute path or ensure profiles/ is copied into the image."
+        )
 
     with profile_path.open("r", encoding="utf-8") as profile_file:
         raw_data = yaml.safe_load(profile_file) or {}
