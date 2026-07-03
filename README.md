@@ -16,6 +16,7 @@ Servidor HTTP ligero y compatible con OpenAI, optimizado para minimizar TTFT med
   - timeout por inactividad
   - limite maximo de conversaciones activas
 - Configuracion por variables de entorno
+- Perfil global de modelo cargado al inicio (`MODEL_PROFILE`)
 - Despliegue con Docker Compose
 
 ## Estructura
@@ -42,6 +43,19 @@ requirements.txt
 - `SESSION_TIMEOUT` en segundos (default: `1800`)
 - `MAX_ACTIVE_CONVERSATIONS` (default: `1000`)
 - `MAX_NUM_IMAGES` (default: `4`, habilita entradas multimodales de imagen)
+- `MODEL_PROFILE` (default: `profiles/default.yaml`)
+
+## Perfil global del modelo
+
+- El backend carga una sola vez el perfil YAML al iniciar el servidor.
+- El perfil soporta `system_prompt`, `memory` y `generation` (por ejemplo `temperature`, `top_p`, etc.).
+- El `system_prompt`/`memory` del perfil se inyecta solo en el bootstrap de la conversacion para preservar KV cache en turnos siguientes.
+- Si el cliente envia mensajes `system`/`developer`, se combinan con el perfil solo durante ese bootstrap inicial.
+- El bootstrap usa API nativa del SDK (`Engine.create_conversation(messages=..., system_message=...)`), sin `send_message()` artificial.
+
+Ejemplo de archivo: `profiles/default.yaml`.
+
+Detalles tecnicos verificados de la API instalada: `docs/litert-lm-sdk-findings.md`.
 
 ## Estrategia de conversation_id
 
@@ -65,6 +79,7 @@ El servicio quedara disponible en:
 - `http://localhost:${HOST_PORT}/v1/models`
 - `http://localhost:${HOST_PORT}/v1/chat/completions`
 - `http://localhost:${HOST_PORT}/healthz`
+- `http://localhost:${HOST_PORT}/internal/profile` (solo desarrollo)
 
 ## Nota de rendimiento
 

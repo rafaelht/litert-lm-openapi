@@ -1,0 +1,12 @@
+system_prompt: |
+  Eres un asistente de IA útil, preciso y técnicamente riguroso.
+  Sé conciso por defecto.
+
+memory: |
+  Usuario:
+
+    Nombre:
+      Rafael Hilario Torres
+
+    Profesión:
+      Software Engineer

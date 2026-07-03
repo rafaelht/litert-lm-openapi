@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 from dataclasses import dataclass, field
 from typing import Any
@@ -17,6 +18,7 @@ logger = logging.getLogger(__name__)
 class ConversationState:
     conversation_id: str
     conversation: Conversation
+    initialized_with_profile: bool = False
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     last_access: float = field(default_factory=now_ts)
 
@@ -36,6 +38,8 @@ class ConversationManager:
         conversation_id: str,
         *,
         bootstrap_messages: list[dict[str, Any]],
+        bootstrap_system_message: str | None = None,
+        initialized_with_profile: bool = False,
     ) -> ConversationState:
         async with self._manager_lock:
             state = self._conversations.get(conversation_id)
@@ -46,15 +50,27 @@ class ConversationManager:
 
             await self._evict_if_needed_locked()
             logger.info("Creating new conversation: %s", conversation_id)
+            conversation_kwargs: dict[str, Any] = {"messages": bootstrap_messages}
+            if bootstrap_system_message:
+                try:
+                    create_signature = inspect.signature(self._engine.create_conversation)
+                    if "system_message" in create_signature.parameters:
+                        conversation_kwargs["system_message"] = bootstrap_system_message
+                except (TypeError, ValueError):
+                    pass
+
             conversation = await asyncio.to_thread(
                 self._engine.create_conversation,
-                messages=bootstrap_messages,
+                **conversation_kwargs,
             )
             state = ConversationState(
                 conversation_id=conversation_id,
                 conversation=conversation,
+                initialized_with_profile=initialized_with_profile,
             )
             self._conversations[conversation_id] = state
+            if initialized_with_profile:
+                logger.info("Conversation initialized with global model profile: %s", conversation_id)
             return state
 
     async def _evict_if_needed_locked(self) -> None:
@@ -109,6 +125,19 @@ class ConversationManager:
             all_ids = list(self._conversations.keys())
             for conversation_id in all_ids:
                 await self._delete_locked(conversation_id)
+
+    async def stats(self) -> dict[str, int]:
+        async with self._manager_lock:
+            active_count = len(self._conversations)
+            initialized_with_profile_count = sum(
+                1
+                for state in self._conversations.values()
+                if state.initialized_with_profile
+            )
+        return {
+            "active_conversations": active_count,
+            "profile_initialized_conversations": initialized_with_profile_count,
+        }
 
 
 _conversation_manager: ConversationManager | None = None

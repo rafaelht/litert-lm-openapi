@@ -15,6 +15,7 @@ from app.conversation_manager import (
 )
 from app.engine import close_engine, init_engine
 from app.openai_routes import router as openai_router
+from app.profile_store import get_profile_store, init_profile_store
 
 logging.basicConfig(
     level=logging.INFO,
@@ -46,6 +47,9 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
 
     settings = get_settings()
     logger.info("Starting LiteRT Session Server on port %s", settings.server_port)
+    logger.info("Using model profile path: %s", settings.model_profile)
+
+    await init_profile_store()
 
     engine = await init_engine()
     await init_conversation_manager(engine)
@@ -77,3 +81,15 @@ app.include_router(openai_router)
 @app.get("/healthz")
 async def healthz() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/internal/profile")
+async def internal_profile() -> dict[str, object]:
+    profile_store = get_profile_store()
+    manager = get_conversation_manager()
+    stats = await manager.stats()
+    return {
+        "profile": profile_store.as_debug_dict(),
+        "active_conversations": stats["active_conversations"],
+        "profile_initialized_conversations": stats["profile_initialized_conversations"],
+    }

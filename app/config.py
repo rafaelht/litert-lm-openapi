@@ -9,6 +9,7 @@ from pathlib import Path
 @dataclass(frozen=True)
 class Settings:
     model_path: str
+    model_profile: str
     server_port: int
     session_timeout: int
     max_active_conversations: int
@@ -26,6 +27,7 @@ def get_settings() -> Settings:
             "MODEL_PATH",
             "/models/gemma-4-E2B-it.litertlm/model.litertlm",
         ),
+        model_profile=os.getenv("MODEL_PROFILE", "profiles/default.yaml"),
         server_port=int(os.getenv("SERVER_PORT", "8000")),
         session_timeout=int(os.getenv("SESSION_TIMEOUT", "1800")),
         max_active_conversations=int(os.getenv("MAX_ACTIVE_CONVERSATIONS", "1000")),

@@ -187,24 +187,6 @@ def extract_incremental_message_payload(messages: list[dict[str, Any]]) -> str |
     return normalize_text_content(content)
 
 
-def _prepend_system_prompt_to_content(content: Any, system_prompt: str) -> Any:
-    if not system_prompt:
-        return content
-
-    if isinstance(content, str):
-        if not content:
-            return system_prompt
-        return f"{system_prompt}\n\n{content}"
-
-    if isinstance(content, list):
-        return [{"type": "text", "text": f"{system_prompt}\n\n"}, *content]
-
-    text_content = normalize_text_content(content)
-    if text_content:
-        return f"{system_prompt}\n\n{text_content}"
-    return system_prompt
-
-
 def bootstrap_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """
     Formatea el historial OpenAI convirtiendo prompts del sistema en contexto inyectado 
@@ -213,26 +195,16 @@ def bootstrap_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     if len(messages) <= 1:
         return []
 
-    system_prompt = extract_system_prompt(messages)
     history = messages[:-1]
     bootstrapped: list[dict[str, Any]] = []
 
-    first_user_idx = -1
-    for i, msg in enumerate(history):
-        if msg.get("role") == "user":
-            first_user_idx = i
-            break
-
-    for i, msg in enumerate(history):
+    for msg in history:
         role = msg.get("role")
         if role in {"system", "developer"}:
             continue
 
         translated = translate_openai_message(msg)
         content = translated.get("content", "")
-
-        if i == first_user_idx and system_prompt:
-            content = _prepend_system_prompt_to_content(content, system_prompt)
 
         if role in {"user", "assistant"}:
             bootstrapped.append({"role": role, "content": content})

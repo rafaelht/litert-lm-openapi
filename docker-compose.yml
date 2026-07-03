@@ -9,6 +9,7 @@ services:
       SESSION_TIMEOUT: ${SESSION_TIMEOUT:-1800}
       MAX_ACTIVE_CONVERSATIONS: ${MAX_ACTIVE_CONVERSATIONS:-1000}
       MAX_NUM_IMAGES: ${MAX_NUM_IMAGES:-4}
+      MODEL_PROFILE: ${MODEL_PROFILE:-profiles/default.yaml}
     ports:
       - "${HOST_PORT:-8005}:${SERVER_PORT:-8000}"
     volumes:

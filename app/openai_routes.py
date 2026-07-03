@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import time
@@ -14,6 +15,7 @@ from anyio import to_thread
 from app.config import get_settings
 from app.conversation_manager import get_conversation_manager
 from app.engine import get_engine, init_engine, update_engine_activity, check_and_consume_reload_flag
+from app.profile_store import get_profile_store
 from app.schemas import (
     ChatCompletionChoice,
     ChatCompletionMessage,
@@ -34,6 +36,29 @@ from app.utils import (
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/v1", tags=["openai-compatible"])
+
+
+def _build_method_kwargs(method: Any, generation_params: dict[str, Any]) -> dict[str, Any]:
+    if not generation_params:
+        return {}
+
+    try:
+        signature = inspect.signature(method)
+    except (TypeError, ValueError):
+        return {}
+
+    accepts_var_kwargs = any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for parameter in signature.parameters.values()
+    )
+    if accepts_var_kwargs:
+        return generation_params
+
+    return {
+        key: value
+        for key, value in generation_params.items()
+        if key in signature.parameters
+    }
 
 
 def _sse_data(payload: dict[str, Any] | str) -> str:
@@ -97,6 +122,8 @@ async def chat_completions(
     raw_request: Request,
     authorization: str | None = Header(default=None),
 ) -> Response:
+    profile_store = get_profile_store()
+
     message_dicts = [
         message.model_dump(by_alias=True, exclude_none=True)
         for message in request.messages
@@ -205,6 +232,8 @@ async def chat_completions(
     api_key = extract_api_key(authorization)
     conversation_id = make_conversation_id(api_key, request.model, message_dicts)
     manager = get_conversation_manager()
+    bootstrap_system_prompt = profile_store.combined_bootstrap_system_prompt(message_dicts)
+    effective_generation_params = profile_store.effective_generation_params(request)
 
     # Si el motor se recreó, actualizar referencias internas y limpiar el caché
     if check_and_consume_reload_flag():
@@ -221,7 +250,16 @@ async def chat_completions(
     state = await manager.get_or_create(
         conversation_id,
         bootstrap_messages=bootstrap_messages(message_dicts),
+        bootstrap_system_message=bootstrap_system_prompt,
+        initialized_with_profile=True,
     )
+
+    if effective_generation_params:
+        logger.info(
+            "Effective generation params for conversation %s: %s",
+            conversation_id,
+            sorted(effective_generation_params.keys()),
+        )
     
     update_engine_activity()
 
@@ -248,7 +286,14 @@ async def chat_completions(
                 yield _sse_data(first_chunk)
 
                 try:
-                    iterator = state.conversation.send_message_async(incremental_payload)
+                    send_kwargs = _build_method_kwargs(
+                        state.conversation.send_message_async,
+                        effective_generation_params,
+                    )
+                    iterator = state.conversation.send_message_async(
+                        incremental_payload,
+                        **send_kwargs,
+                    )
                     
                     while True:
                         disconnected = await raw_request.is_disconnected()
@@ -325,9 +370,14 @@ async def chat_completions(
         state.touch()
         update_engine_activity()
         try:
+            send_kwargs = _build_method_kwargs(
+                state.conversation.send_message,
+                effective_generation_params,
+            )
             sdk_response = await asyncio.to_thread(
                 state.conversation.send_message,
                 incremental_payload,
+                **send_kwargs,
             )
         except Exception as exc:
             logger.exception("Completion failed for conversation %s", conversation_id)
