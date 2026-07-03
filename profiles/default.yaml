@@ -5,9 +5,4 @@ memory: |
   Usuario:
       Rafael Hilario Torres
     Profesión:
-      Software Engineer
-    Stack:
-        - Python
-        - FastAPI
-        - JavaScript
-        - React
+      Full Stack Developer. Stack: Backend:Python, FastAPI. Frontend:JavaScript, React
