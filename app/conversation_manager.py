@@ -66,7 +66,13 @@ class ConversationManager:
 
             await self._evict_if_needed_locked()
             logger.info("Creating new conversation: %s", conversation_id)
-            conversation_kwargs: dict[str, Any] = {"messages": bootstrap_messages}
+            prepared_bootstrap_messages, bootstrap_summary, bootstrap_recent_messages = (
+                self._prepare_bootstrap_context(
+                    bootstrap_messages=bootstrap_messages,
+                    bootstrap_system_message=bootstrap_system_message or "",
+                )
+            )
+            conversation_kwargs: dict[str, Any] = {"messages": prepared_bootstrap_messages}
             if bootstrap_system_message:
                 try:
                     create_signature = inspect.signature(self._engine.create_conversation)
@@ -83,9 +89,8 @@ class ConversationManager:
                 conversation_id=conversation_id,
                 conversation=conversation,
                 bootstrap_system_message=bootstrap_system_message or "",
-                rolling_messages=self._trim_recent_messages(
-                    self._filter_conversation_messages(bootstrap_messages)
-                ),
+                rolling_messages=bootstrap_recent_messages,
+                summary_text=bootstrap_summary,
                 initialized_with_profile=initialized_with_profile,
             )
             state.last_known_token_count = self._estimate_context_tokens(
@@ -97,6 +102,87 @@ class ConversationManager:
             if initialized_with_profile:
                 logger.info("Conversation initialized with global model profile: %s", conversation_id)
             return state
+
+    def _prepare_bootstrap_context(
+        self,
+        *,
+        bootstrap_messages: list[dict[str, Any]],
+        bootstrap_system_message: str,
+    ) -> tuple[list[dict[str, Any]], str, list[dict[str, Any]]]:
+        filtered_messages = self._filter_conversation_messages(bootstrap_messages)
+        recent_messages = self._trim_recent_messages(filtered_messages)
+        bootstrap_tokens = self._estimate_context_tokens(
+            bootstrap_system_message,
+            "",
+            filtered_messages,
+        )
+
+        if bootstrap_tokens <= self._rollover_threshold_tokens:
+            return bootstrap_messages, "", recent_messages
+
+        older_messages = filtered_messages[: max(0, len(filtered_messages) - len(recent_messages))]
+        summary_text = self._compact_summary_text(
+            self._build_bootstrap_recovery_summary(older_messages)
+        )
+        compact_messages = self._build_rollover_messages(summary_text, recent_messages)
+
+        while recent_messages and self._estimate_context_tokens(
+            bootstrap_system_message,
+            summary_text,
+            recent_messages,
+        ) > self._rollover_threshold_tokens:
+            recent_messages = recent_messages[1:]
+            compact_messages = self._build_rollover_messages(summary_text, recent_messages)
+
+        after_tokens = self._estimate_context_tokens(
+            bootstrap_system_message,
+            summary_text,
+            recent_messages,
+        )
+        if after_tokens > self._rollover_threshold_tokens:
+            summary_text = ""
+            compact_messages = list(recent_messages)
+            while recent_messages and self._estimate_context_tokens(
+                bootstrap_system_message,
+                "",
+                recent_messages,
+            ) > self._rollover_threshold_tokens:
+                recent_messages = recent_messages[1:]
+                compact_messages = list(recent_messages)
+            after_tokens = self._estimate_context_tokens(
+                bootstrap_system_message,
+                "",
+                recent_messages,
+            )
+
+        logger.warning(
+            "Compacted oversized bootstrap before conversation create: before_tokens=%s after_tokens=%s original_messages=%s recent_messages=%s",
+            bootstrap_tokens,
+            after_tokens,
+            len(filtered_messages),
+            len(recent_messages),
+        )
+        return compact_messages, summary_text, recent_messages
+
+    def _build_bootstrap_recovery_summary(self, messages: list[dict[str, Any]]) -> str:
+        if not messages:
+            return ""
+
+        transcript = self._messages_to_transcript(messages)
+        if not transcript:
+            return ""
+
+        lines = transcript.splitlines()
+        head = lines[:4]
+        tail = lines[-8:] if len(lines) > 8 else lines
+        summary_parts = [
+            "Recovered prior chat context after inactivity.",
+            "Earlier context:",
+            *head,
+        ]
+        if tail != head:
+            summary_parts.extend(["Recent older context:", *tail])
+        return "\n".join(summary_parts)
 
     async def prepare_for_turn(
         self,
