@@ -85,11 +85,18 @@ async def healthz() -> dict[str, str]:
 
 @app.get("/internal/profile")
 async def internal_profile() -> dict[str, object]:
+    settings = get_settings()
     profile_store = get_profile_store()
     manager = get_conversation_manager()
     stats = await manager.stats()
     return {
         "profile": profile_store.as_debug_dict(),
+        "settings": {
+            "enable_thinking": settings.enable_thinking,
+            "enable_tool_calling": settings.enable_tool_calling,
+            "filter_thinking_from_kv_cache": settings.filter_thinking_from_kv_cache,
+            "context_rollover_threshold_tokens": settings.context_rollover_threshold_tokens,
+        },
         "active_conversations": stats["active_conversations"],
         "profile_initialized_conversations": stats["profile_initialized_conversations"],
     }

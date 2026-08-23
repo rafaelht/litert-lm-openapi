@@ -39,6 +39,8 @@ class ChatCompletionRequest(BaseModel):
     presence_penalty: float | None = Field(default=None, alias="presence_penalty")
     frequency_penalty: float | None = Field(default=None, alias="frequency_penalty")
     user: str | None = None
+    tools: list[dict[str, Any]] | None = None
+    tool_choice: Any | None = Field(default=None, alias="tool_choice")
 
 
 class ChatCompletionMessage(BaseModel):

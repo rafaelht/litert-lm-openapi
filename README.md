@@ -47,6 +47,9 @@ requirements.txt
 - `CONTEXT_ROLLOVER_THRESHOLD_TOKENS` (default: `3200`)
 - `CONTEXT_ROLLOVER_RECENT_MESSAGES` (default: `2`, rango soportado: `1` a `3`)
 - `CONTEXT_ROLLOVER_RECENT_TOKEN_BUDGET` (default: `256`)
+- `ENABLE_THINKING` (default: `false`, activa `enable_thinking` en el template del modelo si el `.litertlm` lo soporta)
+- `ENABLE_TOOL_CALLING` (default: `true`, acepta schemas `tools` enviados por clientes compatibles con OpenAI)
+- `FILTER_THINKING_FROM_KV_CACHE` (default: `true`, evita persistir canales de thinking/reasoning en KV cache)
 
 ## Rolling Context Automatico
 
@@ -60,6 +63,18 @@ requirements.txt
   - y rehidrata solo los ultimos N mensajes recientes sin superar `CONTEXT_ROLLOVER_RECENT_TOKEN_BUDGET`.
 - Se conserva internamente el mismo `conversation_id`, por lo que OpenWebUI no percibe el cambio.
 - El rollover emite logs con tokens antes/despues para facilitar observabilidad.
+
+## Thinking y Tools
+
+- El modelo `gemma-4-E2B-it.litertlm` incluido contiene soporte de template para `enable_thinking`, `<|think|>`, canales de reasoning y `<|tool_call>`.
+- Para activar Thinking:
+
+```bash
+ENABLE_THINKING=true
+```
+
+- Los `tools` enviados por OpenWebUI en `/v1/chat/completions` se pasan al SDK como descriptores de funciones.
+- El servidor devuelve `tool_calls` en formato OpenAI-compatible y deja la ejecucion real a OpenWebUI. Esto permite usar tools externas, como monitoreo de NAS o contenedores Docker, sin que este backend tenga que conocerlas o ejecutarlas localmente.
 
 ## Perfil global del modelo
 

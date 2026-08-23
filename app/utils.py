@@ -129,12 +129,51 @@ def _translate_content_part(part: dict[str, Any]) -> dict[str, Any] | Any:
     return part
 
 
-def translate_openai_message(message: dict[str, Any]) -> dict[str, Any]:
+def _tool_call_names_by_id(messages: list[dict[str, Any]]) -> dict[str, str]:
+    names: dict[str, str] = {}
+    for message in messages:
+        tool_calls = message.get("tool_calls")
+        if not isinstance(tool_calls, list):
+            continue
+        for tool_call in tool_calls:
+            if not isinstance(tool_call, dict):
+                continue
+            tool_call_id = tool_call.get("id")
+            function = tool_call.get("function")
+            if (
+                isinstance(tool_call_id, str)
+                and isinstance(function, dict)
+                and isinstance(function.get("name"), str)
+            ):
+                names[tool_call_id] = function["name"]
+    return names
+
+
+def translate_openai_message(
+    message: dict[str, Any],
+    *,
+    tool_response_name: str | None = None,
+) -> dict[str, Any]:
     role = message.get("role", "user")
     content = message.get("content")
+    translated: dict[str, Any] = {"role": role}
+
+    if role == "tool":
+        tool_name = tool_response_name or message.get("name") or message.get("tool_call_id") or "tool"
+        translated["content"] = [
+            {
+                "type": "tool_response",
+                "name": str(tool_name),
+                "response": content,
+            }
+        ]
+        return translated
 
     if not isinstance(content, list):
-        return {"role": role, "content": content}
+        translated["content"] = content
+        if "tool_calls" in message:
+            translated["tool_calls"] = message["tool_calls"]
+        return translated
 
     translated_content: list[Any] = []
     for part in content:
@@ -143,10 +182,10 @@ def translate_openai_message(message: dict[str, Any]) -> dict[str, Any]:
         else:
             translated_content.append(part)
 
-    return {
-        "role": role,
-        "content": translated_content,
-    }
+    translated["content"] = translated_content
+    if "tool_calls" in message:
+        translated["tool_calls"] = message["tool_calls"]
+    return translated
 
 
 def extract_system_prompt(messages: list[dict[str, Any]]) -> str:
@@ -175,7 +214,16 @@ def extract_incremental_message_payload(messages: list[dict[str, Any]]) -> str |
         raise ValueError("messages must not be empty")
 
     last_message = messages[-1]
-    translated = translate_openai_message(last_message)
+    tool_response_name = None
+    if last_message.get("role") == "tool":
+        tool_call_id = last_message.get("tool_call_id")
+        if isinstance(tool_call_id, str):
+            tool_response_name = _tool_call_names_by_id(messages[:-1]).get(tool_call_id)
+
+    translated = translate_openai_message(
+        last_message,
+        tool_response_name=tool_response_name,
+    )
     content = translated.get("content")
 
     if isinstance(content, list):
@@ -197,17 +245,30 @@ def bootstrap_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
     history = messages[:-1]
     bootstrapped: list[dict[str, Any]] = []
+    tool_call_names = _tool_call_names_by_id(history)
 
     for msg in history:
         role = msg.get("role")
         if role in {"system", "developer"}:
             continue
 
-        translated = translate_openai_message(msg)
+        tool_response_name = None
+        if role == "tool":
+            tool_call_id = msg.get("tool_call_id")
+            if isinstance(tool_call_id, str):
+                tool_response_name = tool_call_names.get(tool_call_id)
+
+        translated = translate_openai_message(
+            msg,
+            tool_response_name=tool_response_name,
+        )
         content = translated.get("content", "")
 
-        if role in {"user", "assistant"}:
-            bootstrapped.append({"role": role, "content": content})
+        if role in {"user", "assistant", "tool"}:
+            bootstrapped_message = {"role": role, "content": content}
+            if "tool_calls" in translated:
+                bootstrapped_message["tool_calls"] = translated["tool_calls"]
+            bootstrapped.append(bootstrapped_message)
 
     return bootstrapped
 

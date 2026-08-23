@@ -6,7 +6,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any
 
-from litert_lm import Conversation, Engine
+from litert_lm import Conversation, Engine, Tool
 
 from app.config import get_settings
 from app.utils import normalize_text_content, now_ts, sdk_message_to_text
@@ -24,6 +24,12 @@ class ConversationState:
     last_known_token_count: int = 0
     rollover_count: int = 0
     initialized_with_profile: bool = False
+    tools: list[Tool] = field(default_factory=list)
+    tool_signature: str = ""
+    automatic_tool_calling: bool = True
+    extra_context: dict[str, Any] = field(default_factory=dict)
+    extra_context_signature: str = ""
+    filter_channel_content_from_kv_cache: bool = False
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     last_access: float = field(default_factory=now_ts)
 
@@ -56,10 +62,29 @@ class ConversationManager:
         bootstrap_messages: list[dict[str, Any]],
         bootstrap_system_message: str | None = None,
         initialized_with_profile: bool = False,
+        tools: list[Tool] | None = None,
+        tool_signature: str = "",
+        automatic_tool_calling: bool = True,
+        extra_context: dict[str, Any] | None = None,
+        extra_context_signature: str = "",
+        filter_channel_content_from_kv_cache: bool = False,
     ) -> ConversationState:
         async with self._manager_lock:
             state = self._conversations.get(conversation_id)
             if state is not None:
+                if (
+                    state.tool_signature != tool_signature
+                    or state.extra_context_signature != extra_context_signature
+                ):
+                    await self._refresh_conversation_options_locked(
+                        state,
+                        tools=tools,
+                        tool_signature=tool_signature,
+                        automatic_tool_calling=automatic_tool_calling,
+                        extra_context=extra_context,
+                        extra_context_signature=extra_context_signature,
+                        filter_channel_content_from_kv_cache=filter_channel_content_from_kv_cache,
+                    )
                 state.touch()
                 logger.info("Reusing existing conversation: %s", conversation_id)
                 return state
@@ -73,6 +98,13 @@ class ConversationManager:
                 )
             )
             conversation_kwargs: dict[str, Any] = {"messages": prepared_bootstrap_messages}
+            if tools:
+                conversation_kwargs["tools"] = tools
+                conversation_kwargs["automatic_tool_calling"] = automatic_tool_calling
+            if extra_context:
+                conversation_kwargs["extra_context"] = extra_context
+            if filter_channel_content_from_kv_cache:
+                conversation_kwargs["filter_channel_content_from_kv_cache"] = True
             if bootstrap_system_message:
                 try:
                     create_signature = inspect.signature(self._engine.create_conversation)
@@ -85,6 +117,13 @@ class ConversationManager:
                 self._engine.create_conversation,
                 **conversation_kwargs,
             )
+            effective_tools = tools or []
+            if tools:
+                conversation, effective_tools = await self._drop_tools_if_context_is_too_large(
+                    conversation,
+                    conversation_kwargs,
+                    conversation_id=conversation_id,
+                )
             state = ConversationState(
                 conversation_id=conversation_id,
                 conversation=conversation,
@@ -92,6 +131,12 @@ class ConversationManager:
                 rolling_messages=bootstrap_recent_messages,
                 summary_text=bootstrap_summary,
                 initialized_with_profile=initialized_with_profile,
+                tools=effective_tools,
+                tool_signature=tool_signature,
+                automatic_tool_calling=automatic_tool_calling,
+                extra_context=extra_context or {},
+                extra_context_signature=extra_context_signature,
+                filter_channel_content_from_kv_cache=filter_channel_content_from_kv_cache,
             )
             state.last_known_token_count = self._estimate_context_tokens(
                 bootstrap_system_message or "",
@@ -102,6 +147,60 @@ class ConversationManager:
             if initialized_with_profile:
                 logger.info("Conversation initialized with global model profile: %s", conversation_id)
             return state
+
+    async def _refresh_conversation_options_locked(
+        self,
+        state: ConversationState,
+        *,
+        tools: list[Tool] | None,
+        tool_signature: str,
+        automatic_tool_calling: bool,
+        extra_context: dict[str, Any] | None,
+        extra_context_signature: str,
+        filter_channel_content_from_kv_cache: bool,
+    ) -> None:
+        bootstrap_messages = self._build_rollover_messages(
+            state.summary_text,
+            state.rolling_messages,
+        )
+        new_conversation = await self._create_conversation(
+            bootstrap_messages=bootstrap_messages,
+            bootstrap_system_message=state.bootstrap_system_message,
+            tools=tools,
+            automatic_tool_calling=automatic_tool_calling,
+            extra_context=extra_context,
+            filter_channel_content_from_kv_cache=filter_channel_content_from_kv_cache,
+        )
+        effective_tools = tools or []
+        if tools:
+            new_conversation, effective_tools = await self._drop_tools_if_context_is_too_large(
+                new_conversation,
+                self._conversation_kwargs(
+                    bootstrap_messages=bootstrap_messages,
+                    bootstrap_system_message=state.bootstrap_system_message,
+                    tools=tools,
+                    automatic_tool_calling=automatic_tool_calling,
+                    extra_context=extra_context,
+                    filter_channel_content_from_kv_cache=filter_channel_content_from_kv_cache,
+                ),
+                conversation_id=state.conversation_id,
+            )
+
+        old_conversation = state.conversation
+        state.conversation = new_conversation
+        state.tools = effective_tools
+        state.tool_signature = tool_signature
+        state.automatic_tool_calling = automatic_tool_calling
+        state.extra_context = extra_context or {}
+        state.extra_context_signature = extra_context_signature
+        state.filter_channel_content_from_kv_cache = filter_channel_content_from_kv_cache
+        if hasattr(old_conversation, "close"):
+            try:
+                await asyncio.to_thread(old_conversation.close)
+            except Exception:
+                logger.exception("Error closing old conversation while refreshing options for %s", state.conversation_id)
+
+        logger.info("Refreshed conversation options for %s", state.conversation_id)
 
     def _prepare_bootstrap_context(
         self,
@@ -202,6 +301,10 @@ class ConversationManager:
             current_tokens=current_tokens,
             projected_tokens=projected_tokens,
         )
+        await self._ensure_turn_fits_after_rollover(
+            state,
+            incoming_tokens=incoming_tokens,
+        )
 
     async def register_turn(
         self,
@@ -221,6 +324,58 @@ class ConversationManager:
             state.rolling_messages,
         )
         state.touch()
+
+    async def recover_from_context_overflow(self, state: ConversationState) -> None:
+        logger.warning(
+            "Recovering conversation=%s from SDK context overflow with minimal context",
+            state.conversation_id,
+        )
+        summary_text = self._compact_summary_text(state.summary_text or self._fallback_summary(state))
+        bootstrap_messages = self._build_rollover_messages(summary_text, [])
+        new_conversation = await self._create_conversation(
+            bootstrap_messages=bootstrap_messages,
+            bootstrap_system_message=state.bootstrap_system_message,
+            tools=[],
+            automatic_tool_calling=state.automatic_tool_calling,
+            extra_context={},
+            filter_channel_content_from_kv_cache=state.filter_channel_content_from_kv_cache,
+        )
+
+        actual_tokens = self._safe_token_count(new_conversation)
+        if actual_tokens > self._rollover_threshold_tokens:
+            if hasattr(new_conversation, "close"):
+                try:
+                    await asyncio.to_thread(new_conversation.close)
+                except Exception:
+                    logger.exception("Error closing oversized recovery conversation for %s", state.conversation_id)
+            logger.warning(
+                "Recovery context still too large with system prompt for conversation=%s tokens=%s; retrying without system prompt",
+                state.conversation_id,
+                actual_tokens,
+            )
+            new_conversation = await self._create_conversation(
+                bootstrap_messages=[],
+                bootstrap_system_message=None,
+                tools=[],
+                automatic_tool_calling=state.automatic_tool_calling,
+                extra_context={},
+                filter_channel_content_from_kv_cache=state.filter_channel_content_from_kv_cache,
+            )
+            summary_text = ""
+
+        old_conversation = state.conversation
+        state.conversation = new_conversation
+        state.summary_text = summary_text
+        state.rolling_messages = []
+        state.tools = []
+        state.extra_context = {}
+        state.last_known_token_count = self._safe_token_count(new_conversation)
+        state.rollover_count += 1
+        if hasattr(old_conversation, "close"):
+            try:
+                await asyncio.to_thread(old_conversation.close)
+            except Exception:
+                logger.exception("Error closing old conversation during overflow recovery for %s", state.conversation_id)
 
     async def _perform_context_rollover(
         self,
@@ -243,7 +398,25 @@ class ConversationManager:
         new_conversation = await self._create_conversation(
             bootstrap_messages=rollover_messages,
             bootstrap_system_message=state.bootstrap_system_message,
+            tools=state.tools,
+            automatic_tool_calling=state.automatic_tool_calling,
+            extra_context=state.extra_context,
+            filter_channel_content_from_kv_cache=state.filter_channel_content_from_kv_cache,
         )
+        if state.tools:
+            new_conversation, effective_tools = await self._drop_tools_if_context_is_too_large(
+                new_conversation,
+                self._conversation_kwargs(
+                    bootstrap_messages=rollover_messages,
+                    bootstrap_system_message=state.bootstrap_system_message,
+                    tools=state.tools,
+                    automatic_tool_calling=state.automatic_tool_calling,
+                    extra_context=state.extra_context,
+                    filter_channel_content_from_kv_cache=state.filter_channel_content_from_kv_cache,
+                ),
+                conversation_id=state.conversation_id,
+            )
+            state.tools = effective_tools
 
         old_conversation = state.conversation
         state.conversation = new_conversation
@@ -262,17 +435,91 @@ class ConversationManager:
             state.summary_text,
             state.rolling_messages,
         )
-        state.last_known_token_count = post_tokens
+        actual_post_tokens = self._safe_token_count(state.conversation)
+        state.last_known_token_count = actual_post_tokens or post_tokens
 
         logger.warning(
-            "Context rollover conversation=%s before_tokens=%s projected_tokens=%s after_tokens=%s recent_messages=%s rollovers=%s",
+            "Context rollover conversation=%s before_tokens=%s projected_tokens=%s estimated_after_tokens=%s actual_after_tokens=%s recent_messages=%s rollovers=%s",
             state.conversation_id,
             current_tokens,
             projected_tokens,
             post_tokens,
+            actual_post_tokens,
             len(recent_messages),
             state.rollover_count,
         )
+
+    async def _ensure_turn_fits_after_rollover(
+        self,
+        state: ConversationState,
+        *,
+        incoming_tokens: int,
+    ) -> None:
+        actual_tokens = self._safe_token_count(state.conversation)
+        if actual_tokens + incoming_tokens <= self._rollover_threshold_tokens:
+            return
+
+        if state.tools:
+            logger.warning(
+                "Dropping tool schemas after rollover because actual SDK tokens still exceed budget: conversation=%s tokens=%s incoming=%s threshold=%s",
+                state.conversation_id,
+                actual_tokens,
+                incoming_tokens,
+                self._rollover_threshold_tokens,
+            )
+            await self._recreate_current_context(
+                state,
+                tools=[],
+                extra_context=state.extra_context,
+            )
+            actual_tokens = self._safe_token_count(state.conversation)
+            if actual_tokens + incoming_tokens <= self._rollover_threshold_tokens:
+                return
+
+        if state.extra_context:
+            logger.warning(
+                "Dropping extra context after rollover because actual SDK tokens still exceed budget: conversation=%s tokens=%s incoming=%s threshold=%s",
+                state.conversation_id,
+                actual_tokens,
+                incoming_tokens,
+                self._rollover_threshold_tokens,
+            )
+            await self._recreate_current_context(
+                state,
+                tools=state.tools,
+                extra_context={},
+            )
+
+    async def _recreate_current_context(
+        self,
+        state: ConversationState,
+        *,
+        tools: list[Tool],
+        extra_context: dict[str, Any],
+    ) -> None:
+        bootstrap_messages = self._build_rollover_messages(
+            state.summary_text,
+            state.rolling_messages,
+        )
+        new_conversation = await self._create_conversation(
+            bootstrap_messages=bootstrap_messages,
+            bootstrap_system_message=state.bootstrap_system_message,
+            tools=tools,
+            automatic_tool_calling=state.automatic_tool_calling,
+            extra_context=extra_context,
+            filter_channel_content_from_kv_cache=state.filter_channel_content_from_kv_cache,
+        )
+
+        old_conversation = state.conversation
+        state.conversation = new_conversation
+        state.tools = tools
+        state.extra_context = extra_context
+        state.last_known_token_count = self._safe_token_count(new_conversation)
+        if hasattr(old_conversation, "close"):
+            try:
+                await asyncio.to_thread(old_conversation.close)
+            except Exception:
+                logger.exception("Error closing old conversation during budget recovery for %s", state.conversation_id)
 
     async def _summarize_context(self, state: ConversationState) -> str:
         transcript = self._messages_to_transcript(self._trim_recent_messages(state.rolling_messages))
@@ -346,8 +593,42 @@ class ConversationManager:
         *,
         bootstrap_messages: list[dict[str, Any]],
         bootstrap_system_message: str | None,
+        tools: list[Tool] | None = None,
+        automatic_tool_calling: bool = True,
+        extra_context: dict[str, Any] | None = None,
+        filter_channel_content_from_kv_cache: bool = False,
     ) -> Conversation:
+        conversation_kwargs = self._conversation_kwargs(
+            bootstrap_messages=bootstrap_messages,
+            bootstrap_system_message=bootstrap_system_message,
+            tools=tools,
+            automatic_tool_calling=automatic_tool_calling,
+            extra_context=extra_context,
+            filter_channel_content_from_kv_cache=filter_channel_content_from_kv_cache,
+        )
+        return await asyncio.to_thread(
+            self._engine.create_conversation,
+            **conversation_kwargs,
+        )
+
+    def _conversation_kwargs(
+        self,
+        *,
+        bootstrap_messages: list[dict[str, Any]],
+        bootstrap_system_message: str | None,
+        tools: list[Tool] | None = None,
+        automatic_tool_calling: bool = True,
+        extra_context: dict[str, Any] | None = None,
+        filter_channel_content_from_kv_cache: bool = False,
+    ) -> dict[str, Any]:
         conversation_kwargs: dict[str, Any] = {"messages": bootstrap_messages}
+        if tools:
+            conversation_kwargs["tools"] = tools
+            conversation_kwargs["automatic_tool_calling"] = automatic_tool_calling
+        if extra_context:
+            conversation_kwargs["extra_context"] = extra_context
+        if filter_channel_content_from_kv_cache:
+            conversation_kwargs["filter_channel_content_from_kv_cache"] = True
         if bootstrap_system_message:
             try:
                 create_signature = inspect.signature(self._engine.create_conversation)
@@ -356,10 +637,60 @@ class ConversationManager:
             except (TypeError, ValueError):
                 pass
 
-        return await asyncio.to_thread(
-            self._engine.create_conversation,
-            **conversation_kwargs,
+        return conversation_kwargs
+
+    async def _drop_tools_if_context_is_too_large(
+        self,
+        conversation: Conversation,
+        conversation_kwargs: dict[str, Any],
+        *,
+        conversation_id: str,
+    ) -> tuple[Conversation, list[Tool]]:
+        actual_tokens = self._safe_token_count(conversation)
+        if actual_tokens <= self._rollover_threshold_tokens:
+            return conversation, conversation_kwargs.get("tools", [])
+
+        tool_count = len(conversation_kwargs.get("tools", []))
+        logger.warning(
+            "Disabling tool schemas for conversation=%s because SDK context is already too large after create: tokens=%s threshold=%s tools=%s",
+            conversation_id,
+            actual_tokens,
+            self._rollover_threshold_tokens,
+            tool_count,
         )
+
+        if hasattr(conversation, "close"):
+            try:
+                await asyncio.to_thread(conversation.close)
+            except Exception:
+                logger.exception("Error closing oversized tool conversation for %s", conversation_id)
+
+        fallback_kwargs = dict(conversation_kwargs)
+        fallback_kwargs.pop("tools", None)
+        fallback_kwargs.pop("automatic_tool_calling", None)
+        fallback_conversation = await asyncio.to_thread(
+            self._engine.create_conversation,
+            **fallback_kwargs,
+        )
+        fallback_tokens = self._safe_token_count(fallback_conversation)
+        if fallback_tokens > self._rollover_threshold_tokens and fallback_kwargs.get("extra_context"):
+            logger.warning(
+                "Disabling extra context for conversation=%s because SDK context is still too large after dropping tools: tokens=%s threshold=%s",
+                conversation_id,
+                fallback_tokens,
+                self._rollover_threshold_tokens,
+            )
+            if hasattr(fallback_conversation, "close"):
+                try:
+                    await asyncio.to_thread(fallback_conversation.close)
+                except Exception:
+                    logger.exception("Error closing oversized extra-context conversation for %s", conversation_id)
+            fallback_kwargs.pop("extra_context", None)
+            fallback_conversation = await asyncio.to_thread(
+                self._engine.create_conversation,
+                **fallback_kwargs,
+            )
+        return fallback_conversation, []
 
     def _build_rollover_messages(
         self,
@@ -381,7 +712,7 @@ class ConversationManager:
         if not messages:
             return []
 
-        roles = {"user", "assistant"}
+        roles = {"user", "assistant", "tool"}
         filtered = [m for m in messages if m.get("role") in roles]
         if not filtered:
             return []
@@ -450,7 +781,7 @@ class ConversationManager:
         lines: list[str] = []
         for message in messages:
             role = message.get("role")
-            if role not in {"user", "assistant"}:
+            if role not in {"user", "assistant", "tool"}:
                 continue
             content = self._content_to_text(message.get("content"))
             if not content:
@@ -485,6 +816,12 @@ class ConversationManager:
                     parts.append("[image]")
                 elif item_type in {"audio", "input_audio"}:
                     parts.append("[audio]")
+                elif item_type == "tool_response":
+                    response = item.get("response")
+                    if isinstance(response, str):
+                        parts.append(response.strip())
+                    elif response is not None:
+                        parts.append(str(response))
             return "\n".join(part for part in parts if part)
 
         return ""
@@ -536,7 +873,7 @@ class ConversationManager:
             return None
 
         role = incoming_payload.get("role", "user")
-        if role != "user":
+        if role not in {"user", "tool"}:
             role = "user"
         content = incoming_payload.get("content")
         if not self._content_to_text(content):
@@ -547,9 +884,12 @@ class ConversationManager:
         filtered: list[dict[str, Any]] = []
         for message in messages:
             role = message.get("role")
-            if role not in {"user", "assistant"}:
+            if role not in {"user", "assistant", "tool"}:
                 continue
-            filtered.append({"role": role, "content": message.get("content", "")})
+            filtered_message = {"role": role, "content": message.get("content", "")}
+            if "tool_calls" in message:
+                filtered_message["tool_calls"] = message["tool_calls"]
+            filtered.append(filtered_message)
         return filtered
 
     def _safe_token_count(self, conversation: Conversation) -> int:

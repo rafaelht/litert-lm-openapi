@@ -6,6 +6,35 @@ from functools import lru_cache
 from pathlib import Path
 
 
+_DOTENV_LOADED = False
+
+
+def _load_dotenv() -> None:
+    global _DOTENV_LOADED
+
+    if _DOTENV_LOADED:
+        return
+    _DOTENV_LOADED = True
+
+    env_path = Path.cwd() / ".env"
+    if not env_path.exists():
+        return
+
+    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+def _env_bool(name: str, default: str = "false") -> bool:
+    return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
+
+
 @dataclass(frozen=True)
 class Settings:
     model_path: str
@@ -17,6 +46,9 @@ class Settings:
     context_rollover_threshold_tokens: int
     context_rollover_recent_messages: int
     context_rollover_recent_token_budget: int
+    enable_thinking: bool
+    enable_tool_calling: bool
+    filter_thinking_from_kv_cache: bool
 
     @property
     def model_id(self) -> str:
@@ -25,6 +57,7 @@ class Settings:
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
+    _load_dotenv()
     return Settings(
         model_path=os.getenv(
             "MODEL_PATH",
@@ -44,4 +77,7 @@ def get_settings() -> Settings:
         context_rollover_recent_token_budget=int(
             os.getenv("CONTEXT_ROLLOVER_RECENT_TOKEN_BUDGET", "256")
         ),
+        enable_thinking=_env_bool("ENABLE_THINKING"),
+        enable_tool_calling=_env_bool("ENABLE_TOOL_CALLING", "true"),
+        filter_thinking_from_kv_cache=_env_bool("FILTER_THINKING_FROM_KV_CACHE", "true"),
     )
