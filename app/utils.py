@@ -278,6 +278,8 @@ def sdk_message_to_text(message: Any) -> str:
         return message
 
     if isinstance(message, dict):
+        # Si es un dict válido del SDK (tiene role, channels o content)
+        # y no hay texto, debe retornar "" (no el JSON de debug)
         content = message.get("content")
         if isinstance(content, str):
             return content
@@ -291,10 +293,18 @@ def sdk_message_to_text(message: Any) -> str:
             return "".join(parts)
         if isinstance(content, dict) and isinstance(content.get("text"), str):
             return content["text"]
+            
+        # Es un chunk del SDK pero no tiene texto (ej. solo "channels" de thinking)
+        if "role" in message or "channels" in message or "reasoning_content" in message or "tool_calls" in message:
+            return ""
 
     if hasattr(message, "text"):
         return str(message.text)
+        
+    if hasattr(message, "content"):
+        return str(message.content)
 
+    # Solo en caso de un tipo completamente desconocido (debug)
     try:
         return json.dumps(message, ensure_ascii=False)
     except Exception:

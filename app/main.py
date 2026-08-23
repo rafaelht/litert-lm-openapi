@@ -53,6 +53,13 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
 
     engine = await init_engine()
     await init_conversation_manager(engine)
+    
+    # Pre-warm the profile system prompt
+    profile_store = get_profile_store()
+    manager = get_conversation_manager()
+    system_prompt = profile_store.combined_bootstrap_system_prompt([])
+    asyncio.create_task(manager.warm_system_prompt(system_prompt))
+    
     _cleanup_task = asyncio.create_task(_cleanup_loop())
 
     try:

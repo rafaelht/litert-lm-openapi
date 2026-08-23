@@ -12,6 +12,8 @@ from fastapi import APIRouter, Header, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 from anyio import to_thread
 
+from litert_lm import RepetitionPenaltyConfig, SamplerConfig, ThinkingConfig
+
 from app.config import get_settings
 from app.conversation_manager import get_conversation_manager
 from app.engine import get_engine, init_engine, update_engine_activity, check_and_consume_reload_flag
@@ -79,11 +81,70 @@ def _json_signature(value: Any) -> str:
 
 def _build_extra_context(settings: Any, request: ChatCompletionRequest) -> dict[str, Any]:
     extra_context: dict[str, Any] = {}
-    if settings.enable_thinking:
-        extra_context["enable_thinking"] = True
+    # enable_thinking ahora se maneja via ThinkingConfig nativo (ver _build_thinking_config)
     if request.tool_choice is not None:
         extra_context["tool_choice"] = request.tool_choice
     return extra_context
+
+
+def _build_thinking_config(settings: Any, request: ChatCompletionRequest) -> ThinkingConfig | None:
+    """Construye ThinkingConfig nativo evaluando flags a nivel de request y perfil."""
+    do_thinking = settings.enable_thinking
+
+    # 1. Custom parameter en la raíz
+    if getattr(request, "enable_thinking", None) is not None:
+        val = request.enable_thinking
+        do_thinking = str(val).lower() in ("true", "1", "yes") if isinstance(val, str) else bool(val)
+    elif getattr(request, "reasoning_effort", None) is not None:
+        val = request.reasoning_effort
+        do_thinking = str(val).lower() != "none"
+
+    # 2. OpenWebUI suele enviar custom parameters dentro de un dict "options"
+    if request.model_extra and "options" in request.model_extra:
+        options = request.model_extra["options"]
+        if isinstance(options, dict):
+            if "enable_thinking" in options:
+                val = options["enable_thinking"]
+                do_thinking = str(val).lower() in ("true", "1", "yes") if isinstance(val, str) else bool(val)
+            elif "reasoning_effort" in options:
+                val = options["reasoning_effort"]
+                do_thinking = str(val).lower() != "none"
+
+    try:
+        return ThinkingConfig(enable_thinking=do_thinking)
+    except Exception:
+        return None
+
+
+def _build_sampler_config(generation_params: dict[str, Any]) -> SamplerConfig | None:
+    """Construye SamplerConfig nativo desde los parámetros de generación del perfil."""
+    if not generation_params:
+        return None
+    try:
+        kwargs: dict[str, Any] = {}
+        for key in ("temperature", "top_p", "top_k"):
+            if key in generation_params:
+                kwargs[key] = generation_params[key]
+        return SamplerConfig(**kwargs) if kwargs else None
+    except Exception:
+        return None
+
+
+def _build_repetition_penalty_config(
+    generation_params: dict[str, Any],
+) -> RepetitionPenaltyConfig | None:
+    """Construye RepetitionPenaltyConfig desde los parámetros de generación."""
+    if not generation_params:
+        return None
+    try:
+        kwargs: dict[str, Any] = {}
+        if "presence_penalty" in generation_params:
+            kwargs["presence_penalty"] = generation_params["presence_penalty"]
+        if "frequency_penalty" in generation_params:
+            kwargs["frequency_penalty"] = generation_params["frequency_penalty"]
+        return RepetitionPenaltyConfig(**kwargs) if kwargs else None
+    except Exception:
+        return None
 
 
 def _normalize_tool_calls(message: Any) -> list[dict[str, Any]]:
@@ -142,6 +203,10 @@ def _strip_internal_tool_call_fields(tool_calls: list[dict[str, Any]]) -> list[d
 def _sdk_message_reasoning_text(message: Any) -> str:
     if not isinstance(message, dict):
         return ""
+        
+    reasoning_content = message.get("reasoning_content")
+    if isinstance(reasoning_content, str) and reasoning_content:
+        return reasoning_content
 
     channels = message.get("channels")
     if not isinstance(channels, dict):
@@ -150,9 +215,9 @@ def _sdk_message_reasoning_text(message: Any) -> str:
     parts: list[str] = []
     for key in ("thought", "thinking", "reasoning", "analysis"):
         value = channels.get(key)
-        if isinstance(value, str) and value.strip():
-            parts.append(value.strip())
-    return "\n".join(parts)
+        if isinstance(value, str) and value:
+            parts.append(value)
+    return "".join(parts)
 
 
 def _thinking_open_delta() -> dict[str, str]:
@@ -344,11 +409,21 @@ async def chat_completions(
     manager = get_conversation_manager()
     bootstrap_system_prompt = profile_store.combined_bootstrap_system_prompt(message_dicts)
     effective_generation_params = profile_store.effective_generation_params(request)
+    if request.max_tokens is not None and request.max_tokens > 24:
+        effective_generation_params["max_output_tokens"] = request.max_tokens
+        
     raw_tools = request.tools if settings.enable_tool_calling else None
     openai_tools = normalize_openai_tools(raw_tools)
     tool_sig = tools_signature(raw_tools)
     extra_context = _build_extra_context(settings, request)
     extra_context_sig = _json_signature(extra_context)
+    thinking_config = _build_thinking_config(settings, request)
+    sampler_config = _build_sampler_config(effective_generation_params)
+    repetition_penalty_config = _build_repetition_penalty_config(effective_generation_params)
+    if repetition_penalty_config:
+        effective_generation_params["repetition_penalty_config"] = repetition_penalty_config
+    if thinking_config:
+        effective_generation_params["thinking_config"] = thinking_config
 
     # Si el motor se recreó, actualizar referencias internas y limpiar el caché
     if check_and_consume_reload_flag():
@@ -373,6 +448,8 @@ async def chat_completions(
         extra_context=extra_context,
         extra_context_signature=extra_context_sig,
         filter_channel_content_from_kv_cache=settings.filter_thinking_from_kv_cache,
+        thinking_config=thinking_config,
+        sampler_config=sampler_config,
     )
 
     if effective_generation_params:

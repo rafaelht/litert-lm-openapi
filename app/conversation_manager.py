@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 import logging
 from dataclasses import dataclass, field
@@ -30,6 +31,8 @@ class ConversationState:
     extra_context: dict[str, Any] = field(default_factory=dict)
     extra_context_signature: str = ""
     filter_channel_content_from_kv_cache: bool = False
+    thinking_config: Any = None
+    sampler_config: Any = None
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     last_access: float = field(default_factory=now_ts)
 
@@ -42,6 +45,8 @@ class ConversationManager:
         self._engine = engine
         self._settings = get_settings()
         self._conversations: dict[str, ConversationState] = {}
+        self._warm_pool: dict[str, Any] = {}
+        self._warming_in_progress: set[str] = set()
         self._manager_lock = asyncio.Lock()
         self._rollover_threshold_tokens = max(1, self._settings.context_rollover_threshold_tokens)
         configured_recent = self._settings.context_rollover_recent_messages
@@ -68,6 +73,8 @@ class ConversationManager:
         extra_context: dict[str, Any] | None = None,
         extra_context_signature: str = "",
         filter_channel_content_from_kv_cache: bool = False,
+        thinking_config: Any = None,
+        sampler_config: Any = None,
     ) -> ConversationState:
         async with self._manager_lock:
             state = self._conversations.get(conversation_id)
@@ -97,26 +104,57 @@ class ConversationManager:
                     bootstrap_system_message=bootstrap_system_message or "",
                 )
             )
-            conversation_kwargs: dict[str, Any] = {"messages": prepared_bootstrap_messages}
-            if tools:
-                conversation_kwargs["tools"] = tools
-                conversation_kwargs["automatic_tool_calling"] = automatic_tool_calling
-            if extra_context:
-                conversation_kwargs["extra_context"] = extra_context
-            if filter_channel_content_from_kv_cache:
-                conversation_kwargs["filter_channel_content_from_kv_cache"] = True
-            if bootstrap_system_message:
-                try:
-                    create_signature = inspect.signature(self._engine.create_conversation)
-                    if "system_message" in create_signature.parameters:
-                        conversation_kwargs["system_message"] = bootstrap_system_message
-                except (TypeError, ValueError):
-                    pass
 
-            conversation = await asyncio.to_thread(
-                self._engine.create_conversation,
-                **conversation_kwargs,
+            warm_conv = None
+            if bootstrap_system_message:
+                pool_key = hashlib.sha256(bootstrap_system_message.encode()).hexdigest()[:16]
+                warm_conv = self._warm_pool.pop(pool_key, None)
+
+            conversation_kwargs = self._conversation_kwargs(
+                bootstrap_messages=prepared_bootstrap_messages,
+                bootstrap_system_message=bootstrap_system_message,
+                tools=tools,
+                automatic_tool_calling=automatic_tool_calling,
+                extra_context=extra_context,
+                filter_channel_content_from_kv_cache=filter_channel_content_from_kv_cache,
+                thinking_config=thinking_config,
+                sampler_config=sampler_config,
             )
+
+            if warm_conv is not None:
+                logger.info("Using pre-warmed conversation for %s (TTFT saved)", conversation_id)
+                conversation = warm_conv
+                if prepared_bootstrap_messages:
+                    for msg in prepared_bootstrap_messages:
+                        try:
+                            # send_message processes the tokens for the history message
+                            # Wait, the SDK needs to know if this is a user or assistant msg.
+                            # send_message normally expects the payload for generation.
+                            # Actually, if we use a pre-warmed conversation, we can't easily inject a list of messages.
+                            # So the warm pool is ONLY useful if bootstrap_messages is empty.
+                            # Otherwise, we fallback to create_conversation.
+                            pass
+                        except Exception:
+                            pass
+                    # Let's fix this in the logic.
+            
+            # Re-evaluate warm_conv logic: we can only use it if prepared_bootstrap_messages is empty
+            if warm_conv is not None and not prepared_bootstrap_messages and not tools:
+                logger.info("Using pre-warmed conversation for %s (TTFT saved)", conversation_id)
+                conversation = warm_conv
+                # Start warming the next one in background
+                asyncio.create_task(self.warm_system_prompt(bootstrap_system_message))
+            else:
+                if warm_conv is not None:
+                    # Put it back since we couldn't use it
+                    pool_key = hashlib.sha256(bootstrap_system_message.encode()).hexdigest()[:16]
+                    self._warm_pool[pool_key] = warm_conv
+                    
+                conversation = await asyncio.to_thread(
+                    self._engine.create_conversation,
+                    **conversation_kwargs,
+                )
+
             effective_tools = tools or []
             if tools:
                 conversation, effective_tools = await self._drop_tools_if_context_is_too_large(
@@ -124,6 +162,7 @@ class ConversationManager:
                     conversation_kwargs,
                     conversation_id=conversation_id,
                 )
+                
             state = ConversationState(
                 conversation_id=conversation_id,
                 conversation=conversation,
@@ -137,6 +176,8 @@ class ConversationManager:
                 extra_context=extra_context or {},
                 extra_context_signature=extra_context_signature,
                 filter_channel_content_from_kv_cache=filter_channel_content_from_kv_cache,
+                thinking_config=thinking_config,
+                sampler_config=sampler_config,
             )
             state.last_known_token_count = self._estimate_context_tokens(
                 bootstrap_system_message or "",
@@ -170,6 +211,8 @@ class ConversationManager:
             automatic_tool_calling=automatic_tool_calling,
             extra_context=extra_context,
             filter_channel_content_from_kv_cache=filter_channel_content_from_kv_cache,
+            thinking_config=state.thinking_config,
+            sampler_config=state.sampler_config,
         )
         effective_tools = tools or []
         if tools:
@@ -182,6 +225,8 @@ class ConversationManager:
                     automatic_tool_calling=automatic_tool_calling,
                     extra_context=extra_context,
                     filter_channel_content_from_kv_cache=filter_channel_content_from_kv_cache,
+                    thinking_config=state.thinking_config,
+                    sampler_config=state.sampler_config,
                 ),
                 conversation_id=state.conversation_id,
             )
@@ -339,6 +384,8 @@ class ConversationManager:
             automatic_tool_calling=state.automatic_tool_calling,
             extra_context={},
             filter_channel_content_from_kv_cache=state.filter_channel_content_from_kv_cache,
+            thinking_config=state.thinking_config,
+            sampler_config=state.sampler_config,
         )
 
         actual_tokens = self._safe_token_count(new_conversation)
@@ -354,12 +401,14 @@ class ConversationManager:
                 actual_tokens,
             )
             new_conversation = await self._create_conversation(
-                bootstrap_messages=[],
+                bootstrap_messages=bootstrap_messages,
                 bootstrap_system_message=None,
                 tools=[],
                 automatic_tool_calling=state.automatic_tool_calling,
                 extra_context={},
                 filter_channel_content_from_kv_cache=state.filter_channel_content_from_kv_cache,
+                thinking_config=state.thinking_config,
+                sampler_config=state.sampler_config,
             )
             summary_text = ""
 
@@ -402,6 +451,8 @@ class ConversationManager:
             automatic_tool_calling=state.automatic_tool_calling,
             extra_context=state.extra_context,
             filter_channel_content_from_kv_cache=state.filter_channel_content_from_kv_cache,
+            thinking_config=state.thinking_config,
+            sampler_config=state.sampler_config,
         )
         if state.tools:
             new_conversation, effective_tools = await self._drop_tools_if_context_is_too_large(
@@ -413,6 +464,8 @@ class ConversationManager:
                     automatic_tool_calling=state.automatic_tool_calling,
                     extra_context=state.extra_context,
                     filter_channel_content_from_kv_cache=state.filter_channel_content_from_kv_cache,
+                    thinking_config=state.thinking_config,
+                    sampler_config=state.sampler_config,
                 ),
                 conversation_id=state.conversation_id,
             )
@@ -508,6 +561,8 @@ class ConversationManager:
             automatic_tool_calling=state.automatic_tool_calling,
             extra_context=extra_context,
             filter_channel_content_from_kv_cache=state.filter_channel_content_from_kv_cache,
+            thinking_config=state.thinking_config,
+            sampler_config=state.sampler_config,
         )
 
         old_conversation = state.conversation
@@ -597,6 +652,8 @@ class ConversationManager:
         automatic_tool_calling: bool = True,
         extra_context: dict[str, Any] | None = None,
         filter_channel_content_from_kv_cache: bool = False,
+        thinking_config: Any = None,
+        sampler_config: Any = None,
     ) -> Conversation:
         conversation_kwargs = self._conversation_kwargs(
             bootstrap_messages=bootstrap_messages,
@@ -605,6 +662,8 @@ class ConversationManager:
             automatic_tool_calling=automatic_tool_calling,
             extra_context=extra_context,
             filter_channel_content_from_kv_cache=filter_channel_content_from_kv_cache,
+            thinking_config=thinking_config,
+            sampler_config=sampler_config,
         )
         return await asyncio.to_thread(
             self._engine.create_conversation,
@@ -620,6 +679,8 @@ class ConversationManager:
         automatic_tool_calling: bool = True,
         extra_context: dict[str, Any] | None = None,
         filter_channel_content_from_kv_cache: bool = False,
+        thinking_config: Any = None,
+        sampler_config: Any = None,
     ) -> dict[str, Any]:
         conversation_kwargs: dict[str, Any] = {"messages": bootstrap_messages}
         if tools:
@@ -629,13 +690,17 @@ class ConversationManager:
             conversation_kwargs["extra_context"] = extra_context
         if filter_channel_content_from_kv_cache:
             conversation_kwargs["filter_channel_content_from_kv_cache"] = True
-        if bootstrap_system_message:
-            try:
-                create_signature = inspect.signature(self._engine.create_conversation)
-                if "system_message" in create_signature.parameters:
-                    conversation_kwargs["system_message"] = bootstrap_system_message
-            except (TypeError, ValueError):
-                pass
+            
+        try:
+            create_signature = inspect.signature(self._engine.create_conversation)
+            if bootstrap_system_message and "system_message" in create_signature.parameters:
+                conversation_kwargs["system_message"] = bootstrap_system_message
+            if thinking_config is not None and "thinking_config" in create_signature.parameters:
+                conversation_kwargs["thinking_config"] = thinking_config
+            if sampler_config is not None and "sampler_config" in create_signature.parameters:
+                conversation_kwargs["sampler_config"] = sampler_config
+        except (TypeError, ValueError):
+            pass
 
         return conversation_kwargs
 
@@ -945,11 +1010,41 @@ class ConversationManager:
             except Exception:
                 logger.exception("Error closing conversation backend thread for %s", conversation_id)
 
+    async def warm_system_prompt(self, system_message: str) -> None:
+        """Pre-calienta una conversación con el system prompt dado."""
+        if not system_message:
+            return
+        
+        pool_key = hashlib.sha256(system_message.encode()).hexdigest()[:16]
+        if pool_key in self._warm_pool or pool_key in self._warming_in_progress:
+            return
+        
+        self._warming_in_progress.add(pool_key)
+        try:
+            warm_conv = await asyncio.to_thread(
+                self._engine.create_conversation,
+                system_message=system_message,
+                messages=[],
+            )
+            self._warm_pool[pool_key] = warm_conv
+            logger.info("Pre-warmed conversation for system prompt (hash=%s)", pool_key)
+        except Exception:
+            logger.exception("Failed to pre-warm conversation")
+        finally:
+            self._warming_in_progress.discard(pool_key)
+
     async def close_all(self) -> None:
         async with self._manager_lock:
             all_ids = list(self._conversations.keys())
             for conversation_id in all_ids:
                 await self._delete_locked(conversation_id)
+            for conv in self._warm_pool.values():
+                if hasattr(conv, "close"):
+                    try:
+                        await asyncio.to_thread(conv.close)
+                    except Exception:
+                        logger.exception("Error closing warm pool conversation")
+            self._warm_pool.clear()
 
     async def stats(self) -> dict[str, int]:
         async with self._manager_lock:

@@ -41,6 +41,9 @@ class ChatCompletionRequest(BaseModel):
     user: str | None = None
     tools: list[dict[str, Any]] | None = None
     tool_choice: Any | None = Field(default=None, alias="tool_choice")
+    
+    reasoning_effort: str | None = None
+    enable_thinking: bool | None = None
 
 
 class ChatCompletionMessage(BaseModel):
