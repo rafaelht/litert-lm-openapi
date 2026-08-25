@@ -32,12 +32,12 @@ class ChatCompletionRequest(BaseModel):
     stream: bool = False
 
     temperature: float | None = None
-    top_p: float | None = Field(default=None, alias="top_p")
+    top_p: float | None = None
     n: int | None = None
-    max_tokens: int | None = Field(default=None, alias="max_tokens")
+    max_tokens: int | None = None
     stop: str | list[str] | None = None
-    presence_penalty: float | None = Field(default=None, alias="presence_penalty")
-    frequency_penalty: float | None = Field(default=None, alias="frequency_penalty")
+    presence_penalty: float | None = None
+    frequency_penalty: float | None = None
     user: str | None = None
 
 
