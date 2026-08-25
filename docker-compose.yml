@@ -16,7 +16,7 @@ services:
     ports:
       - "${HOST_PORT:-8005}:${SERVER_PORT:-8000}"
     volumes:
-      - /volume2/docker/litertlm/litert-home/models:/models:ro
+      - /volume2/docker/litertlm/litert-home/models:/models
       - ./profiles:/app/profiles:ro
     deploy:
       resources:

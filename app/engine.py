@@ -86,10 +86,20 @@ async def init_engine() -> Engine:
             engine_kwargs["max_num_images"] = settings.max_num_images
         if settings.max_num_images > 0 and "vision_backend" in engine_signature.parameters:
             engine_kwargs["vision_backend"] = Backend.CPU()
-        if "use_ringbuffers_local_attention" in engine_signature.parameters:
-            engine_kwargs["use_ringbuffers_local_attention"] = True
-        if "enable_ynnpack" in engine_signature.parameters:
-            engine_kwargs["enable_ynnpack"] = True
+        
+        # Configuración de directorio de caché para XNNPACK
+        cache_dir = os.getenv("CACHE_DIR")
+        if not cache_dir:
+            model_path_obj = Path(settings.model_path)
+            model_dir = model_path_obj.parent if model_path_obj.is_file() or not model_path_obj.is_dir() else model_path_obj
+            if os.access(model_dir, os.W_OK):
+                cache_dir = str(model_dir)
+            else:
+                cache_dir = "/tmp/litert_cache"
+                os.makedirs(cache_dir, exist_ok=True)
+
+        if "cache_dir" in engine_signature.parameters and cache_dir:
+            engine_kwargs["cache_dir"] = cache_dir
 
         _engine = await asyncio.to_thread(Engine, settings.model_path, **engine_kwargs)
         logger.info("LiteRT engine initialized")
