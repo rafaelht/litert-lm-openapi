@@ -73,13 +73,14 @@ class ConversationManager:
                 )
             )
             conversation_kwargs: dict[str, Any] = {"messages": prepared_bootstrap_messages}
-            if bootstrap_system_message:
-                try:
-                    create_signature = inspect.signature(self._engine.create_conversation)
-                    if "system_message" in create_signature.parameters:
-                        conversation_kwargs["system_message"] = bootstrap_system_message
-                except (TypeError, ValueError):
-                    pass
+            try:
+                create_signature = inspect.signature(self._engine.create_conversation)
+                if bootstrap_system_message and "system_message" in create_signature.parameters:
+                    conversation_kwargs["system_message"] = bootstrap_system_message
+                if "filter_channel_content_from_kv_cache" in create_signature.parameters:
+                    conversation_kwargs["filter_channel_content_from_kv_cache"] = True
+            except (TypeError, ValueError):
+                pass
 
             conversation = await asyncio.to_thread(
                 self._engine.create_conversation,
@@ -348,13 +349,14 @@ class ConversationManager:
         bootstrap_system_message: str | None,
     ) -> Conversation:
         conversation_kwargs: dict[str, Any] = {"messages": bootstrap_messages}
-        if bootstrap_system_message:
-            try:
-                create_signature = inspect.signature(self._engine.create_conversation)
-                if "system_message" in create_signature.parameters:
-                    conversation_kwargs["system_message"] = bootstrap_system_message
-            except (TypeError, ValueError):
-                pass
+        try:
+            create_signature = inspect.signature(self._engine.create_conversation)
+            if bootstrap_system_message and "system_message" in create_signature.parameters:
+                conversation_kwargs["system_message"] = bootstrap_system_message
+            if "filter_channel_content_from_kv_cache" in create_signature.parameters:
+                conversation_kwargs["filter_channel_content_from_kv_cache"] = True
+        except (TypeError, ValueError):
+            pass
 
         return await asyncio.to_thread(
             self._engine.create_conversation,

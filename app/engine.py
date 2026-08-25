@@ -86,6 +86,10 @@ async def init_engine() -> Engine:
             engine_kwargs["max_num_images"] = settings.max_num_images
         if settings.max_num_images > 0 and "vision_backend" in engine_signature.parameters:
             engine_kwargs["vision_backend"] = Backend.CPU()
+        if "use_ringbuffers_local_attention" in engine_signature.parameters:
+            engine_kwargs["use_ringbuffers_local_attention"] = True
+        if "enable_ynnpack" in engine_signature.parameters:
+            engine_kwargs["enable_ynnpack"] = True
 
         _engine = await asyncio.to_thread(Engine, settings.model_path, **engine_kwargs)
         logger.info("LiteRT engine initialized")

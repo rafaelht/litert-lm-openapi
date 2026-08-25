@@ -11,12 +11,13 @@ services:
       CONTEXT_ROLLOVER_THRESHOLD_TOKENS: ${CONTEXT_ROLLOVER_THRESHOLD_TOKENS:-3200}
       CONTEXT_ROLLOVER_RECENT_MESSAGES: ${CONTEXT_ROLLOVER_RECENT_MESSAGES:-2}
       CONTEXT_ROLLOVER_RECENT_TOKEN_BUDGET: ${CONTEXT_ROLLOVER_RECENT_TOKEN_BUDGET:-256}
-      MAX_NUM_IMAGES: ${MAX_NUM_IMAGES:-4}
+      MAX_NUM_IMAGES: ${MAX_NUM_IMAGES:-0}
       MODEL_PROFILE: ${MODEL_PROFILE:-profiles/default.yaml}
     ports:
       - "${HOST_PORT:-8005}:${SERVER_PORT:-8000}"
     volumes:
       - /volume2/docker/litertlm/litert-home/models:/models:ro
+      - ./profiles:/app/profiles:ro
     deploy:
       resources:
         limits:

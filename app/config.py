@@ -34,7 +34,7 @@ def get_settings() -> Settings:
         server_port=int(os.getenv("SERVER_PORT", "8000")),
         session_timeout=int(os.getenv("SESSION_TIMEOUT", "1800")),
         max_active_conversations=int(os.getenv("MAX_ACTIVE_CONVERSATIONS", "1000")),
-        max_num_images=int(os.getenv("MAX_NUM_IMAGES", "4")),
+        max_num_images=int(os.getenv("MAX_NUM_IMAGES", "0")),
         context_rollover_threshold_tokens=int(
             os.getenv("CONTEXT_ROLLOVER_THRESHOLD_TOKENS", "3200")
         ),
