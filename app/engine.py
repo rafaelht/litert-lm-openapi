@@ -102,6 +102,8 @@ async def init_engine() -> Engine:
 
         if "cache_dir" in engine_signature.parameters and cache_dir:
             engine_kwargs["cache_dir"] = cache_dir
+        if "enable_benchmark" in engine_signature.parameters:
+            engine_kwargs["enable_benchmark"] = True
 
         _engine = await asyncio.to_thread(Engine, settings.model_path, **engine_kwargs)
         logger.info("LiteRT engine initialized")

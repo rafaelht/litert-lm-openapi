@@ -53,15 +53,31 @@ class ChatCompletionChoice(BaseModel):
 
 
 class ChatCompletionUsage(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     prompt_tokens: int
     completion_tokens: int
     total_tokens: int
+    prompt_eval_count: int | None = None
+    prompt_eval_duration: int | None = None
+    eval_count: int | None = None
+    eval_duration: int | None = None
+    total_duration: int | None = None
+    load_duration: int | None = None
 
 
 class ChatCompletionResponse(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     id: str
     object: Literal["chat.completion"] = "chat.completion"
     created: int
     model: str
     choices: list[ChatCompletionChoice]
     usage: ChatCompletionUsage
+    prompt_eval_count: int | None = None
+    prompt_eval_duration: int | None = None
+    eval_count: int | None = None
+    eval_duration: int | None = None
+    total_duration: int | None = None
+    load_duration: int | None = None

@@ -14,7 +14,7 @@ from anyio import to_thread
 
 from app.config import get_settings
 from app.conversation_manager import get_conversation_manager
-from app.engine import get_engine, init_engine, update_engine_activity, check_and_consume_reload_flag
+from app.engine import get_engine, init_engine, update_engine_activity, check_and_consume_reload_flag, force_garbage_collection
 from app.profile_store import get_profile_store
 from app.schemas import (
     ChatCompletionChoice,
@@ -79,6 +79,63 @@ def _estimate_token_count(text: str) -> int:
         return len(tokens) if isinstance(tokens, list) else 0
     except Exception:
         return 0
+
+
+def _compute_usage_and_metrics(
+    conversation: Any,
+    prompt_text: str,
+    response_text: str,
+    t_start: float,
+    t_first_token: float | None,
+    t_end: float,
+) -> dict[str, Any]:
+    prompt_tokens = _estimate_token_count(prompt_text)
+    completion_tokens = _estimate_token_count(response_text)
+
+    bench = None
+    try:
+        if hasattr(conversation, "get_benchmark_info"):
+            bench = conversation.get_benchmark_info()
+    except Exception:
+        bench = None
+
+    total_duration_ns = int(max(0.001, t_end - t_start) * 1e9)
+    load_duration_ns = int(bench.init_time_in_second * 1e9) if bench else 0
+
+    if bench and bench.last_prefill_token_count > 0:
+        p_tokens = bench.last_prefill_token_count
+        p_duration_ns = int((p_tokens / max(0.1, bench.last_prefill_tokens_per_second)) * 1e9) if bench.last_prefill_tokens_per_second > 0 else 0
+    else:
+        p_tokens = prompt_tokens
+        if t_first_token is not None and t_first_token > t_start:
+            p_duration_ns = int((t_first_token - t_start) * 1e9)
+        else:
+            p_duration_ns = 0
+
+    if bench and bench.last_decode_token_count > 0:
+        c_tokens = bench.last_decode_token_count
+        c_duration_ns = int((c_tokens / max(0.1, bench.last_decode_tokens_per_second)) * 1e9) if bench.last_decode_tokens_per_second > 0 else 0
+    else:
+        c_tokens = completion_tokens
+        if t_first_token is not None:
+            c_duration_ns = int(max(0.001, t_end - t_first_token) * 1e9)
+        else:
+            c_duration_ns = total_duration_ns
+
+    final_prompt_tokens = prompt_tokens if prompt_tokens > 0 else p_tokens
+    final_completion_tokens = completion_tokens if completion_tokens > 0 else c_tokens
+
+    return {
+        "prompt_tokens": final_prompt_tokens,
+        "completion_tokens": final_completion_tokens,
+        "total_tokens": final_prompt_tokens + final_completion_tokens,
+        "prompt_eval_count": p_tokens,
+        "prompt_eval_duration": p_duration_ns,
+        "eval_count": c_tokens,
+        "eval_duration": c_duration_ns,
+        "total_duration": total_duration_ns,
+        "load_duration": load_duration_ns,
+    }
 
 
 def _generate_heuristic_title(prompt: str) -> str:
@@ -263,9 +320,15 @@ async def chat_completions(
     
     update_engine_activity()
 
+    prompt_text = "\n".join(normalize_text_content(msg.get("content")) for msg in message_dicts)
+
     if request.stream:
 
         async def event_stream() -> AsyncIterator[str]:
+            t_start = time.perf_counter()
+            t_first_token: float | None = None
+            streamed_text_parts: list[str] = []
+
             async with state.lock:
                 state.touch()
                 update_engine_activity()
@@ -295,7 +358,6 @@ async def chat_completions(
                         incremental_payload,
                         **send_kwargs,
                     )
-                    streamed_text_parts: list[str] = []
                     
                     while True:
                         disconnected = await raw_request.is_disconnected()
@@ -306,6 +368,9 @@ async def chat_completions(
                                 break
                         except StopIteration:
                             break
+
+                        if t_first_token is None:
+                            t_first_token = time.perf_counter()
 
                         state.touch()
                         update_engine_activity()
@@ -331,13 +396,16 @@ async def chat_completions(
                             }
                             yield _sse_data(payload)
 
+                    t_end = time.perf_counter()
+                    full_response = "".join(streamed_text_parts)
                     await manager.register_turn(
                         state,
                         incremental_payload,
-                        "".join(streamed_text_parts),
+                        full_response,
                     )
                         
                 except Exception as exc:
+                    t_end = time.perf_counter()
                     logger.exception("Streaming failed for conversation %s", conversation_id)
                     err_payload = {
                         "error": {
@@ -347,6 +415,16 @@ async def chat_completions(
                         }
                     }
                     yield _sse_data(err_payload)
+
+                full_response = "".join(streamed_text_parts)
+                usage_dict = _compute_usage_and_metrics(
+                    state.conversation,
+                    prompt_text,
+                    full_response,
+                    t_start,
+                    t_first_token,
+                    t_end,
+                )
 
                 final_chunk = {
                     "id": completion_id,
@@ -360,9 +438,32 @@ async def chat_completions(
                             "finish_reason": "stop",
                         }
                     ],
+                    "usage": usage_dict,
+                    "prompt_eval_count": usage_dict.get("prompt_eval_count"),
+                    "prompt_eval_duration": usage_dict.get("prompt_eval_duration"),
+                    "eval_count": usage_dict.get("eval_count"),
+                    "eval_duration": usage_dict.get("eval_duration"),
+                    "total_duration": usage_dict.get("total_duration"),
                 }
                 yield _sse_data(final_chunk)
+
+                # Chunk explícito de uso (OpenAI stream_options)
+                usage_chunk = {
+                    "id": completion_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": request.model,
+                    "choices": [],
+                    "usage": usage_dict,
+                    "prompt_eval_count": usage_dict.get("prompt_eval_count"),
+                    "prompt_eval_duration": usage_dict.get("prompt_eval_duration"),
+                    "eval_count": usage_dict.get("eval_count"),
+                    "eval_duration": usage_dict.get("eval_duration"),
+                    "total_duration": usage_dict.get("total_duration"),
+                }
+                yield _sse_data(usage_chunk)
                 yield _sse_data("[DONE]")
+                force_garbage_collection()
 
         return StreamingResponse(
             event_stream(),
@@ -375,6 +476,7 @@ async def chat_completions(
         )
 
     # Bloque síncrono estándar (No-Stream)
+    t_start = time.perf_counter()
     async with state.lock:
         state.touch()
         update_engine_activity()
@@ -392,17 +494,23 @@ async def chat_completions(
         except Exception as exc:
             logger.exception("Completion failed for conversation %s", conversation_id)
             raise HTTPException(status_code=500, detail=str(exc)) from exc
+        
+        t_end = time.perf_counter()
+        response_text = sdk_message_to_text(sdk_response)
         await manager.register_turn(
             state,
             incremental_payload,
-            sdk_message_to_text(sdk_response),
+            response_text,
         )
 
-    response_text = sdk_message_to_text(sdk_response)
-
-    prompt_text = "\n".join(normalize_text_content(msg.get("content")) for msg in message_dicts)
-    prompt_tokens = _estimate_token_count(prompt_text)
-    completion_tokens = _estimate_token_count(response_text)
+    usage_dict = _compute_usage_and_metrics(
+        state.conversation,
+        prompt_text,
+        response_text,
+        t_start,
+        None,
+        t_end,
+    )
 
     response = ChatCompletionResponse(
         id=completion_id,
@@ -414,11 +522,14 @@ async def chat_completions(
                 finish_reason="stop",
             )
         ],
-        usage=ChatCompletionUsage(
-            prompt_tokens=prompt_tokens,
-            completion_tokens=completion_tokens,
-            total_tokens=prompt_tokens + completion_tokens,
-        ),
+        usage=ChatCompletionUsage(**usage_dict),
+        prompt_eval_count=usage_dict.get("prompt_eval_count"),
+        prompt_eval_duration=usage_dict.get("prompt_eval_duration"),
+        eval_count=usage_dict.get("eval_count"),
+        eval_duration=usage_dict.get("eval_duration"),
+        total_duration=usage_dict.get("total_duration"),
+        load_duration=usage_dict.get("load_duration"),
     )
+    force_garbage_collection()
 
     return JSONResponse(content=response.model_dump(by_alias=True, exclude_none=True))
