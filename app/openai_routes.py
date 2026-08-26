@@ -29,6 +29,8 @@ from app.utils import (
     bootstrap_messages,
     extract_api_key,
     extract_incremental_message_payload,
+    extract_tool_calls_from_text,
+    format_tools_system_prompt,
     make_conversation_id,
     normalize_text_content,
     sdk_message_to_text,
@@ -397,10 +399,17 @@ async def chat_completions(
     if thinking_override:
         logger.info("[THINKING] Modo thinking activado por parámetros para conversación %s", conversation_id)
 
+    tools_system_prompt = format_tools_system_prompt(request.tools)
+    if tools_system_prompt:
+        logger.info("[TOOLS] %d herramientas inyectadas en la conversación %s", len(request.tools), conversation_id)
+
     bootstrap_system_prompt = profile_store.combined_bootstrap_system_prompt(
         message_dicts,
         thinking_override=thinking_override,
     )
+    if tools_system_prompt:
+        bootstrap_system_prompt = f"{bootstrap_system_prompt}\n\n{tools_system_prompt}" if bootstrap_system_prompt else tools_system_prompt
+
     effective_generation_params = profile_store.effective_generation_params(request)
 
     # Si el motor se recreó, actualizar referencias internas y limpiar el caché
@@ -470,6 +479,9 @@ async def chat_completions(
                         **send_kwargs,
                     )
                     
+                    yielded_len = 0
+                    tool_tag_prefix = "<tool_call>"
+
                     while True:
                         disconnected = await raw_request.is_disconnected()
 
@@ -491,24 +503,59 @@ async def chat_completions(
                             if not text_piece:
                                 continue
                             streamed_text_parts.append(text_piece)
+                            accumulated = "".join(streamed_text_parts)
 
-                            payload = {
-                                "id": completion_id,
-                                "object": "chat.completion.chunk",
-                                "created": created,
-                                "model": request.model,
-                                "choices": [
-                                    {
-                                        "index": 0,
-                                        "delta": {"content": text_piece},
-                                        "finish_reason": None,
+                            # Si hay una tool_call en progreso, retener el texto de la tool_call
+                            if "<tool_call>" in accumulated:
+                                before_tool = accumulated.split("<tool_call>", 1)[0]
+                                if len(before_tool) > yielded_len:
+                                    delta_text = before_tool[yielded_len:]
+                                    yielded_len = len(before_tool)
+                                    payload = {
+                                        "id": completion_id,
+                                        "object": "chat.completion.chunk",
+                                        "created": created,
+                                        "model": request.model,
+                                        "choices": [{"index": 0, "delta": {"content": delta_text}, "finish_reason": None}],
                                     }
-                                ],
-                            }
-                            yield _sse_data(payload)
+                                    yield _sse_data(payload)
+                            else:
+                                # Comprobar si el final de la cadena coincide con el inicio de '<tool_call>'
+                                tail_len = 0
+                                for i in range(len(tool_tag_prefix) - 1, 0, -1):
+                                    if accumulated.endswith(tool_tag_prefix[:i]):
+                                        tail_len = i
+                                        break
+                                
+                                safe_end = len(accumulated) - tail_len
+                                if safe_end > yielded_len:
+                                    delta_text = accumulated[yielded_len:safe_end]
+                                    yielded_len = safe_end
+                                    payload = {
+                                        "id": completion_id,
+                                        "object": "chat.completion.chunk",
+                                        "created": created,
+                                        "model": request.model,
+                                        "choices": [{"index": 0, "delta": {"content": delta_text}, "finish_reason": None}],
+                                    }
+                                    yield _sse_data(payload)
+
+                    # Al finalizar el stream, emitir cualquier texto restante si no era una tool_call
+                    accumulated = "".join(streamed_text_parts)
+                    if "<tool_call>" not in accumulated and len(accumulated) > yielded_len:
+                        delta_text = accumulated[yielded_len:]
+                        yielded_len = len(accumulated)
+                        payload = {
+                            "id": completion_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": request.model,
+                            "choices": [{"index": 0, "delta": {"content": delta_text}, "finish_reason": None}],
+                        }
+                        yield _sse_data(payload)
 
                     t_end = time.perf_counter()
-                    full_response = "".join(streamed_text_parts)
+                    full_response = accumulated
                     await manager.register_turn(
                         state,
                         incremental_payload,
@@ -537,6 +584,10 @@ async def chat_completions(
                     t_end,
                 )
 
+                full_response = "".join(streamed_text_parts)
+                extracted_tool_calls = extract_tool_calls_from_text(full_response)
+                finish_reason = "tool_calls" if extracted_tool_calls else "stop"
+
                 final_chunk = {
                     "id": completion_id,
                     "object": "chat.completion.chunk",
@@ -545,8 +596,8 @@ async def chat_completions(
                     "choices": [
                         {
                             "index": 0,
-                            "delta": {},
-                            "finish_reason": "stop",
+                            "delta": {"tool_calls": extracted_tool_calls} if extracted_tool_calls else {},
+                            "finish_reason": finish_reason,
                         }
                     ],
                     "usage": usage_dict,
@@ -623,14 +674,20 @@ async def chat_completions(
         t_end,
     )
 
+    extracted_tool_calls = extract_tool_calls_from_text(response_text)
+    finish_reason = "tool_calls" if extracted_tool_calls else "stop"
+
     response = ChatCompletionResponse(
         id=completion_id,
         created=created,
         model=request.model,
         choices=[
             ChatCompletionChoice(
-                message=ChatCompletionMessage(content=response_text),
-                finish_reason="stop",
+                message=ChatCompletionMessage(
+                    content=response_text if not extracted_tool_calls else None,
+                    tool_calls=extracted_tool_calls,
+                ),
+                finish_reason=finish_reason,
             )
         ],
         usage=ChatCompletionUsage(**usage_dict),

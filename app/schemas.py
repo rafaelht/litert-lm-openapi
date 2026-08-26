@@ -21,7 +21,10 @@ class ChatMessage(BaseModel):
     model_config = ConfigDict(extra="allow")
 
     role: str
-    content: Any
+    content: Any = ""
+    name: str | None = None
+    tool_calls: list[dict[str, Any]] | None = None
+    tool_call_id: str | None = None
 
 
 class ChatCompletionRequest(BaseModel):
@@ -41,11 +44,14 @@ class ChatCompletionRequest(BaseModel):
     user: str | None = None
     reasoning_effort: str | None = None
     thinking: bool | dict[str, Any] | None = None
+    tools: list[dict[str, Any]] | None = None
+    tool_choice: Any | None = None
 
 
 class ChatCompletionMessage(BaseModel):
     role: Literal["assistant"] = "assistant"
-    content: str
+    content: str | None = None
+    tool_calls: list[dict[str, Any]] | None = None
 
 
 class ChatCompletionChoice(BaseModel):

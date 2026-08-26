@@ -129,9 +129,93 @@ def _translate_content_part(part: dict[str, Any]) -> dict[str, Any] | Any:
     return part
 
 
+def format_tools_system_prompt(tools: list[dict[str, Any]] | None) -> str:
+    """Genera la sección del system prompt con las herramientas disponibles de forma compacta y eficiente."""
+    if not tools:
+        return ""
+
+    tool_descs: list[str] = []
+    for tool in tools:
+        fn = tool.get("function") if tool.get("type") == "function" or "function" in tool else tool
+        if not fn or not isinstance(fn, dict):
+            continue
+        name = fn.get("name", "")
+        if not name:
+            continue
+        desc = fn.get("description", "").strip()
+        if desc:
+            desc = desc.split("\n")[0].strip()
+
+        params = fn.get("parameters", {})
+        param_names: list[str] = []
+        if isinstance(params, dict):
+            props = params.get("properties", {})
+            if isinstance(props, dict):
+                for p_name, p_info in props.items():
+                    p_type = p_info.get("type", "") if isinstance(p_info, dict) else ""
+                    param_names.append(f"{p_name}: {p_type}" if p_type else p_name)
+
+        sig = f"{name}({', '.join(param_names)})"
+        tool_descs.append(f"- `{sig}`: {desc}" if desc else f"- `{sig}`")
+
+    tools_block = "\n".join(tool_descs)
+    return (
+        "# Available Tools:\n"
+        f"{tools_block}\n\n"
+        "To call a tool, respond with a JSON tool call wrapped in <tool_call>...</tool_call>:\n"
+        "<tool_call>\n"
+        '{"name": "tool_name", "arguments": {"param_key": "param_val"}}\n'
+        "</tool_call>\n"
+        "Call the tool first when asked for status, monitoring, containers or real-time data."
+    )
+
+
+def extract_tool_calls_from_text(text: str) -> list[dict[str, Any]] | None:
+    """Extrae llamadas a herramientas en formato <tool_call> o JSON."""
+    if not text:
+        return None
+
+    import re
+    import uuid
+
+    matches = re.findall(r"<tool_call>\s*({.*?})\s*</tool_call>", text, re.DOTALL)
+    if not matches:
+        matches = re.findall(r"```(?:json)?\s*({[^{}]*?\"name\"\s*:[^{}]*?})\s*```", text, re.DOTALL)
+
+    tool_calls: list[dict[str, Any]] = []
+    for raw_json in matches:
+        try:
+            data = json.loads(raw_json)
+            if isinstance(data, dict) and "name" in data:
+                fn_name = data.get("name")
+                fn_args = data.get("arguments", {})
+                if not isinstance(fn_args, str):
+                    fn_args = json.dumps(fn_args, ensure_ascii=False)
+                tool_calls.append({
+                    "id": f"call_{uuid.uuid4().hex[:8]}",
+                    "type": "function",
+                    "function": {
+                        "name": fn_name,
+                        "arguments": fn_args,
+                    },
+                })
+        except Exception:
+            continue
+
+    return tool_calls if tool_calls else None
+
+
 def translate_openai_message(message: dict[str, Any]) -> dict[str, Any]:
     role = message.get("role", "user")
     content = message.get("content")
+    name = message.get("name") or message.get("tool_call_id") or "tool"
+
+    if role in {"tool", "function"}:
+        text_content = normalize_text_content(content)
+        return {
+            "role": "user",
+            "content": f"[Tool Result for {name}]:\n{text_content}",
+        }
 
     if not isinstance(content, list):
         return {"role": role, "content": content}
@@ -159,7 +243,7 @@ def extract_system_prompt(messages: list[dict[str, Any]]) -> str:
 
 def extract_first_user_message(messages: list[dict[str, Any]]) -> str:
     for message in messages:
-        if message.get("role") == "user":
+        if message.get("role") in {"user", "tool", "function"}:
             return normalize_text_content(message.get("content")).strip()
     return ""
 
@@ -167,7 +251,9 @@ def extract_first_user_message(messages: list[dict[str, Any]]) -> str:
 def extract_incremental_message(messages: list[dict[str, Any]]) -> str:
     if not messages:
         raise ValueError("messages must not be empty")
-    return normalize_text_content(messages[-1].get("content", ""))
+    last_msg = messages[-1]
+    trans = translate_openai_message(last_msg)
+    return normalize_text_content(trans.get("content", ""))
 
 
 def extract_incremental_message_payload(messages: list[dict[str, Any]]) -> str | dict[str, Any]:
@@ -190,7 +276,7 @@ def extract_incremental_message_payload(messages: list[dict[str, Any]]) -> str |
 def bootstrap_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """
     Formatea el historial OpenAI convirtiendo prompts del sistema en contexto inyectado 
-    y filtrando solo los turnos que LiteRT entiende (user/assistant).
+    y adaptando turnos (user/assistant/tool) a LiteRT.
     """
     if len(messages) <= 1:
         return []
@@ -205,9 +291,10 @@ def bootstrap_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
         translated = translate_openai_message(msg)
         content = translated.get("content", "")
+        trans_role = translated.get("role", role)
 
-        if role in {"user", "assistant"}:
-            bootstrapped.append({"role": role, "content": content})
+        if trans_role in {"user", "assistant"}:
+            bootstrapped.append({"role": trans_role, "content": content})
 
     return bootstrapped
 
