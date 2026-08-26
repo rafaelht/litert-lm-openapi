@@ -9,6 +9,7 @@ from typing import Any
 from litert_lm import Conversation, Engine
 
 from app.config import get_settings
+from app.engine import force_garbage_collection
 from app.utils import normalize_text_content, now_ts, sdk_message_to_text
 
 logger = logging.getLogger(__name__)
@@ -40,8 +41,8 @@ class ConversationManager:
         self._rollover_threshold_tokens = max(1, self._settings.context_rollover_threshold_tokens)
         configured_recent = self._settings.context_rollover_recent_messages
         self._rollover_recent_messages = min(3, max(1, configured_recent))
-        self._rollover_recent_token_budget = max(64, self._settings.context_rollover_recent_token_budget)
-        self._rollover_summary_token_budget = 64
+        self._rollover_recent_token_budget = max(512, self._settings.context_rollover_recent_token_budget)
+        self._rollover_summary_token_budget = 96
         if configured_recent != self._rollover_recent_messages:
             logger.warning(
                 "CONTEXT_ROLLOVER_RECENT_MESSAGES=%s is out of supported range [1,3]; using %s",
@@ -189,15 +190,31 @@ class ConversationManager:
         self,
         state: ConversationState,
         incoming_payload: str | dict[str, Any],
+        thinking_enabled: bool = False,
     ) -> None:
         current_tokens = self._safe_token_count(state.conversation)
         incoming_tokens = self._estimate_tokens_from_payload(incoming_payload)
         projected_tokens = current_tokens + incoming_tokens
         state.last_known_token_count = current_tokens
 
-        if projected_tokens <= self._rollover_threshold_tokens:
+        # Garantizar margen suficiente para generación completa sin corte abrupto.
+        # Si thinking está activo, dejamos al menos 1800 tokens de margen (umbral 2200).
+        dynamic_threshold = min(
+            self._rollover_threshold_tokens,
+            2200 if thinking_enabled else 3000,
+        )
+
+        if projected_tokens <= dynamic_threshold:
             return
 
+        logger.info(
+            "[ROLLOVER] Activando rollover preventivo (current=%d, incoming=%d, threshold=%d, thinking=%s) para %s",
+            current_tokens,
+            incoming_tokens,
+            dynamic_threshold,
+            thinking_enabled,
+            state.conversation_id,
+        )
         await self._perform_context_rollover(
             state,
             current_tokens=current_tokens,
@@ -257,6 +274,8 @@ class ConversationManager:
                 await asyncio.to_thread(old_conversation.close)
             except Exception:
                 logger.exception("Error closing old conversation during rollover for %s", state.conversation_id)
+
+        force_garbage_collection()
 
         post_tokens = self._estimate_context_tokens(
             state.bootstrap_system_message,

@@ -44,6 +44,10 @@ def _build_method_kwargs(method: Any, generation_params: dict[str, Any]) -> dict
     if not generation_params:
         return {}
 
+    params = dict(generation_params)
+    if "max_tokens" in params and "max_output_tokens" not in params:
+        params["max_output_tokens"] = params["max_tokens"]
+
     try:
         signature = inspect.signature(method)
     except (TypeError, ValueError):
@@ -54,11 +58,11 @@ def _build_method_kwargs(method: Any, generation_params: dict[str, Any]) -> dict
         for parameter in signature.parameters.values()
     )
     if accepts_var_kwargs:
-        return generation_params
+        return params
 
     return {
         key: value
-        for key, value in generation_params.items()
+        for key, value in params.items()
         if key in signature.parameters
     }
 
@@ -306,6 +310,7 @@ async def chat_completions(
         
         if is_title_req:
             chat_title = "Conversación General"
+            title_conv = None
             try:
                 engine = await init_engine()
                 title_conv = engine.create_conversation(
@@ -316,17 +321,24 @@ async def chat_completions(
                     title_conv.send_message,
                     incremental_message,
                 )
-                title_conv.close()
                 raw_text = sdk_message_to_text(title_response)
                 chat_title = _extract_title_from_response(raw_text)
                 logger.info("[TITLE] Título generado por IA: %s", chat_title)
             except Exception as e:
                 logger.warning("[TITLE ERROR] Falló generación de título por IA, usando heurística: %s", str(e))
                 chat_title = _generate_heuristic_title(incremental_message)
+            finally:
+                if title_conv is not None and hasattr(title_conv, "close"):
+                    try:
+                        title_conv.close()
+                    except Exception:
+                        pass
+                force_garbage_collection()
             
             mock_payload = {"title": chat_title}
 
         else:
+            tags_conv = None
             try:
                 engine = await init_engine()
                 tags_conv = engine.create_conversation(
@@ -337,7 +349,6 @@ async def chat_completions(
                     tags_conv.send_message,
                     incremental_message,
                 )
-                tags_conv.close()
                 raw_text = sdk_message_to_text(tags_response)
                 try:
                     mock_payload = json.loads(raw_text)
@@ -348,6 +359,13 @@ async def chat_completions(
             except Exception as e:
                 logger.warning("[TAGS ERROR] Falló generación de tags: %s", str(e))
                 mock_payload = ["General"]
+            finally:
+                if tags_conv is not None and hasattr(tags_conv, "close"):
+                    try:
+                        tags_conv.close()
+                    except Exception:
+                        pass
+                force_garbage_collection()
 
         mock_json = json.dumps(mock_payload, ensure_ascii=False)
         
@@ -452,7 +470,11 @@ async def chat_completions(
             async with state.lock:
                 state.touch()
                 update_engine_activity()
-                await manager.prepare_for_turn(state, incremental_payload)
+                await manager.prepare_for_turn(
+                    state,
+                    incremental_payload,
+                    thinking_enabled=bool(thinking_override),
+                )
 
                 first_chunk = {
                     "id": completion_id,
@@ -660,7 +682,11 @@ async def chat_completions(
         state.touch()
         update_engine_activity()
         try:
-            await manager.prepare_for_turn(state, incremental_payload)
+            await manager.prepare_for_turn(
+                state,
+                incremental_payload,
+                thinking_enabled=bool(thinking_override),
+            )
             send_kwargs = _build_method_kwargs(
                 state.conversation.send_message,
                 effective_generation_params,
