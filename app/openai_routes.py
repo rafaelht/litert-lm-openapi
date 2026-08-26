@@ -125,6 +125,12 @@ def _compute_usage_and_metrics(
     final_prompt_tokens = prompt_tokens if prompt_tokens > 0 else p_tokens
     final_completion_tokens = completion_tokens if completion_tokens > 0 else c_tokens
 
+    # Cálculo explícito de velocidad de tokens
+    eval_sec = max(0.001, c_duration_ns / 1e9)
+    tokens_per_sec = round(final_completion_tokens / eval_sec, 2)
+    prompt_sec = max(0.001, p_duration_ns / 1e9)
+    prompt_tokens_per_sec = round(final_prompt_tokens / prompt_sec, 2)
+
     return {
         "prompt_tokens": final_prompt_tokens,
         "completion_tokens": final_completion_tokens,
@@ -135,7 +141,70 @@ def _compute_usage_and_metrics(
         "eval_duration": c_duration_ns,
         "total_duration": total_duration_ns,
         "load_duration": load_duration_ns,
+        "tokens_per_second": tokens_per_sec,
+        "eval_rate": f"{tokens_per_sec} tokens/s",
+        "prompt_eval_rate": f"{prompt_tokens_per_sec} tokens/s",
     }
+
+
+def _extract_title_from_response(raw_text: str) -> str:
+    """Extrae de manera robusta el título del JSON o texto retornado por el modelo."""
+    if not raw_text:
+        return "Conversación General"
+    
+    try:
+        data = json.loads(raw_text)
+        if isinstance(data, dict) and "title" in data:
+            return str(data["title"]).strip()
+    except Exception:
+        pass
+    
+    match = re.search(r'\"title\"\s*:\s*\"([^\"]+)\"', raw_text)
+    if match:
+        return match.group(1).strip()
+    
+    cleaned = re.sub(r'```(?:json)?|```', '', raw_text).strip()
+    lines = [line.strip() for line in cleaned.splitlines() if line.strip()]
+    if lines:
+        first = lines[0].replace('"', '').replace('{', '').replace('}', '').replace('title:', '').strip()
+        return first if first else "Conversación General"
+    return "Conversación General"
+
+
+def _is_thinking_requested(request: ChatCompletionRequest) -> bool:
+    """Verifica si OpenWebUI o el cliente solicitó razonamiento/thinking en los parámetros."""
+    # 1. Parámetro directo 'thinking'
+    if request.thinking is not None:
+        if isinstance(request.thinking, bool):
+            return request.thinking
+        if isinstance(request.thinking, dict):
+            return request.thinking.get("type") in {"enabled", "true", True} or bool(request.thinking.get("enabled"))
+        if isinstance(request.thinking, str):
+            return request.thinking.lower() in {"true", "enabled", "on", "1"}
+
+    # 2. Parámetro 'reasoning_effort'
+    if request.reasoning_effort is not None:
+        return str(request.reasoning_effort).lower() not in {"none", "off", "0", "false", ""}
+
+    # 3. Parámetros extra enviados por OpenWebUI / extensiones
+    if request.model_extra:
+        for key in ["thinking", "thought", "reasoning", "enable_thinking"]:
+            val = request.model_extra.get(key)
+            if val is True:
+                return True
+            if isinstance(val, str) and val.lower() in {"true", "enabled", "on", "1"}:
+                return True
+            if isinstance(val, dict) and (val.get("type") in {"enabled", "true"} or val.get("enabled") is True):
+                return True
+        if "reasoning_effort" in request.model_extra:
+            effort = str(request.model_extra["reasoning_effort"]).lower()
+            if effort not in {"none", "off", "0", "false", ""}:
+                return True
+        if "chat_options" in request.model_extra and isinstance(request.model_extra["chat_options"], dict):
+            if request.model_extra["chat_options"].get("thinking") is True:
+                return True
+
+    return False
 
 
 def _generate_heuristic_title(prompt: str) -> str:
@@ -215,34 +284,52 @@ async def chat_completions(
     )
 
     if is_title_req or is_tags_req:
-        logger.info("[BYPASS] Interceptada petición administrativa de OpenWebUI.")
+        logger.info("[TITLE/TAGS] Procesando petición de título/tags de OpenWebUI.")
         
         if is_title_req:
             chat_title = "Conversación General"
             try:
-                user_prompt = ""
-                for msg in reversed(message_dicts):
-                    content = normalize_text_content(msg.get("content", ""))
-                    if content and not any(k in content.lower() for k in ["task:", "generate", "create a concise", "{{prompt"]):
-                        user_prompt = content
-                        break
-                
-                if not user_prompt and message_dicts:
-                    user_prompt = normalize_text_content(message_dicts[0].get("content", ""))
-
-                if "user:" in user_prompt.lower():
-                    user_prompt = user_prompt.lower().split("user:")[-1].strip()
-
-                chat_title = _generate_heuristic_title(user_prompt)
-                
+                engine = await init_engine()
+                title_conv = engine.create_conversation(
+                    system_message='Eres un asistente que resume conversaciones. Genera un título muy conciso y creativo de 3 a 5 palabras con un emoji alusivo en formato JSON: {"title": "..."}.',
+                    max_output_tokens=25,
+                )
+                title_response = await asyncio.to_thread(
+                    title_conv.send_message,
+                    incremental_message,
+                )
+                title_conv.close()
+                raw_text = sdk_message_to_text(title_response)
+                chat_title = _extract_title_from_response(raw_text)
+                logger.info("[TITLE] Título generado por IA: %s", chat_title)
             except Exception as e:
-                logger.error("[BYPASS ERROR] Error procesando título: %s", str(e))
-                chat_title = "Conversación General"
+                logger.warning("[TITLE ERROR] Falló generación de título por IA, usando heurística: %s", str(e))
+                chat_title = _generate_heuristic_title(incremental_message)
             
             mock_payload = {"title": chat_title}
 
         else:
-            mock_payload = ["Technology", "Code"]
+            try:
+                engine = await init_engine()
+                tags_conv = engine.create_conversation(
+                    system_message='Genera 1 a 3 etiquetas muy breves en formato lista JSON: ["tag1", "tag2"].',
+                    max_output_tokens=20,
+                )
+                tags_response = await asyncio.to_thread(
+                    tags_conv.send_message,
+                    incremental_message,
+                )
+                tags_conv.close()
+                raw_text = sdk_message_to_text(tags_response)
+                try:
+                    mock_payload = json.loads(raw_text)
+                    if not isinstance(mock_payload, list):
+                        mock_payload = [str(mock_payload)]
+                except Exception:
+                    mock_payload = ["General"]
+            except Exception as e:
+                logger.warning("[TAGS ERROR] Falló generación de tags: %s", str(e))
+                mock_payload = ["General"]
 
         mock_json = json.dumps(mock_payload, ensure_ascii=False)
         
@@ -289,7 +376,12 @@ async def chat_completions(
     api_key = extract_api_key(authorization)
     conversation_id = make_conversation_id(api_key, request.model, message_dicts)
     manager = get_conversation_manager()
-    bootstrap_system_prompt = profile_store.combined_bootstrap_system_prompt(message_dicts)
+    
+    thinking_override = _is_thinking_requested(request)
+    bootstrap_system_prompt = profile_store.combined_bootstrap_system_prompt(
+        message_dicts,
+        thinking_override=thinking_override,
+    )
     effective_generation_params = profile_store.effective_generation_params(request)
 
     # Si el motor se recreó, actualizar referencias internas y limpiar el caché

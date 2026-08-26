@@ -32,6 +32,7 @@ class ModelProfile:
     system_prompt: str
     memory: Any
     generation_params: dict[str, Any] = field(default_factory=dict)
+    thinking: bool = False
 
     @property
     def name(self) -> str:
@@ -74,16 +75,30 @@ class ProfileStore:
             ]
         )
 
-    def combined_bootstrap_system_prompt(self, request_messages: list[dict[str, Any]]) -> str:
+    def combined_bootstrap_system_prompt(
+        self,
+        request_messages: list[dict[str, Any]],
+        thinking_override: bool | None = None,
+    ) -> str:
         request_system = "\n".join(
             normalize_text_content(msg.get("content"))
             for msg in request_messages
             if msg.get("role") in {"system", "developer"}
         ).strip()
 
+        use_thinking = self._profile.thinking if thinking_override is None else thinking_override
+
+        thinking_block = ""
+        if use_thinking:
+            thinking_block = (
+                "Antes de responder, analiza y razona detalladamente paso a paso dentro de etiquetas <think>...</think>.\n"
+                "Una vez cerrado el bloque </think>, entrega tu respuesta final directamente."
+            )
+
         parts = [
             self._profile.system_prompt.strip(),
             self._render_profile_memory_block(),
+            thinking_block,
             request_system,
         ]
         return "\n\n".join(part for part in parts if part)
@@ -144,6 +159,8 @@ def _parse_profile(raw_data: dict[str, Any], profile_path: Path) -> ModelProfile
     if not isinstance(generation_params, dict):
         raise ValueError("profile.generation must be an object")
 
+    thinking = bool(raw_data.get("thinking", False))
+
     filtered_generation_params = {
         key: value
         for key, value in generation_params.items()
@@ -155,6 +172,7 @@ def _parse_profile(raw_data: dict[str, Any], profile_path: Path) -> ModelProfile
         system_prompt=system_prompt.strip(),
         memory=memory,
         generation_params=filtered_generation_params,
+        thinking=thinking,
     )
 
 

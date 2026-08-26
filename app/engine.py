@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import ctypes
+import gc
 import inspect
 import logging
 import os
+import sys
 import time
 from pathlib import Path
 from typing import Optional
@@ -26,16 +28,14 @@ TTL_SECONDS: int = 3600  # 1 hora en reposo antes de descargar
 
 
 def force_garbage_collection() -> None:
-    """Fuerza a la biblioteca C (glibc) a liberar y devolver las arenas
-    de memoria física (RSS) no utilizadas de vuelta al kernel.
-    """
-    try:
-        libc = ctypes.CDLL("libc.so.6")
-        result = libc.malloc_trim(0)
-        if result == 1:
-            logger.info("Memoria física (RSS) devuelta al sistema operativo exitosamente.")
-    except Exception as e:
-        logger.warning("No se pudo ejecutar malloc_trim de manera nativa: %s", str(e))
+    """Fuerza al recolector de basura de Python y a glibc (en Linux) a devolver memoria al OS."""
+    gc.collect()
+    if sys.platform == "linux":
+        try:
+            libc = ctypes.CDLL("libc.so.6")
+            libc.malloc_trim(0)
+        except Exception:
+            pass
 
 
 def update_engine_activity() -> None:

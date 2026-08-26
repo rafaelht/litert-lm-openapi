@@ -39,6 +39,8 @@ class ChatCompletionRequest(BaseModel):
     presence_penalty: float | None = None
     frequency_penalty: float | None = None
     user: str | None = None
+    reasoning_effort: str | None = None
+    thinking: bool | dict[str, Any] | None = None
 
 
 class ChatCompletionMessage(BaseModel):
