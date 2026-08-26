@@ -183,7 +183,7 @@ def extract_tool_calls_from_text(text: str) -> list[dict[str, Any]] | None:
         matches = re.findall(r"```(?:json)?\s*({[^{}]*?\"name\"\s*:[^{}]*?})\s*```", text, re.DOTALL)
 
     tool_calls: list[dict[str, Any]] = []
-    for raw_json in matches:
+    for i, raw_json in enumerate(matches):
         try:
             data = json.loads(raw_json)
             if isinstance(data, dict) and "name" in data:
@@ -192,6 +192,7 @@ def extract_tool_calls_from_text(text: str) -> list[dict[str, Any]] | None:
                 if not isinstance(fn_args, str):
                     fn_args = json.dumps(fn_args, ensure_ascii=False)
                 tool_calls.append({
+                    "index": i,
                     "id": f"call_{uuid.uuid4().hex[:8]}",
                     "type": "function",
                     "function": {

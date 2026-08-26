@@ -588,6 +588,23 @@ async def chat_completions(
                 extracted_tool_calls = extract_tool_calls_from_text(full_response)
                 finish_reason = "tool_calls" if extracted_tool_calls else "stop"
 
+                if extracted_tool_calls:
+                    logger.info("[TOOLS] Despachando llamada a tool para OpenWebUI: %s", extracted_tool_calls)
+                    tool_chunk = {
+                        "id": completion_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": request.model,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"tool_calls": extracted_tool_calls},
+                                "finish_reason": None,
+                            }
+                        ],
+                    }
+                    yield _sse_data(tool_chunk)
+
                 final_chunk = {
                     "id": completion_id,
                     "object": "chat.completion.chunk",
@@ -596,7 +613,7 @@ async def chat_completions(
                     "choices": [
                         {
                             "index": 0,
-                            "delta": {"tool_calls": extracted_tool_calls} if extracted_tool_calls else {},
+                            "delta": {},
                             "finish_reason": finish_reason,
                         }
                     ],
