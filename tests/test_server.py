@@ -26,6 +26,8 @@ class TestServerOptimizations(unittest.TestCase):
         self.assertEqual(settings.max_active_conversations, 5)
         self.assertEqual(settings.thinking_token_budget, 384)
         self.assertEqual(settings.context_rollover_threshold_tokens, 3400)
+        self.assertFalse(settings.enable_thinking)
+        self.assertTrue(settings.enable_tools)
 
     def test_heuristic_title_generation(self):
         # Texto limpio estándar
@@ -239,7 +241,6 @@ class TestServerOptimizations(unittest.TestCase):
                 )
             )
 
-            # Debe haber disparado el rollover
             self.assertEqual(state.rollover_count, 1)
             self.assertEqual(state.conversation, mock_conv_new)
             self.assertTrue(len(state.summary_text) > 0)
@@ -248,6 +249,73 @@ class TestServerOptimizations(unittest.TestCase):
             self.assertTrue(mock_conv_old.close.called)
         finally:
             loop.close()
+
+    def test_thinking_and_reasoning_handling(self):
+        from app.utils import extract_chunk_content_and_thought, sdk_message_to_text
+
+        # 1. Fragmento de pensamiento serializado como string JSON (el caso del reporte del usuario)
+        raw_user_chunk = (
+            '{"role": "assistant", "channels": {"thought": "Thinking Process:"}, "reasoning_content": "Thinking Process:"}'
+        )
+        content, thought = extract_chunk_content_and_thought(raw_user_chunk)
+        self.assertEqual(content, "")
+        self.assertEqual(thought, "Thinking Process:")
+
+        # sdk_message_to_text debe descartar el JSON y devolver vacío para no contaminar el chat
+        self.assertEqual(sdk_message_to_text(raw_user_chunk), "")
+
+        # 2. Fragmento de diccionario con channels
+        dict_chunk = {
+            "role": "assistant",
+            "channels": {"thought": "Analizando"},
+            "reasoning_content": "Analizando",
+        }
+        content2, thought2 = extract_chunk_content_and_thought(dict_chunk)
+        self.assertEqual(content2, "")
+        self.assertEqual(thought2, "Analizando")
+        self.assertEqual(sdk_message_to_text(dict_chunk), "")
+
+        # 3. Fragmento de respuesta normal final
+        final_chunk = "Un avión funciona gracias a la sustentación"
+        content3, thought3 = extract_chunk_content_and_thought(final_chunk)
+        self.assertEqual(content3, "Un avión funciona gracias a la sustentación")
+        self.assertEqual(thought3, "")
+        self.assertEqual(sdk_message_to_text(final_chunk), "Un avión funciona gracias a la sustentación")
+
+    def test_is_thinking_requested(self):
+        from unittest.mock import patch
+        from app.config import Settings
+        from app.openai_routes import _is_thinking_requested
+        from app.schemas import ChatCompletionRequest, ChatMessage
+
+        req_default = ChatCompletionRequest(
+            model="test",
+            messages=[ChatMessage(role="user", content="hola")],
+            reasoning_effort="default",
+        )
+        req_thinking_true = ChatCompletionRequest(
+            model="test",
+            messages=[ChatMessage(role="user", content="hola")],
+            thinking=True,
+        )
+        req_high = ChatCompletionRequest(
+            model="test",
+            messages=[ChatMessage(role="user", content="hola")],
+            reasoning_effort="high",
+        )
+
+        # 1. Con ENABLE_THINKING=false (por defecto en .env para máxima velocidad)
+        # El thinking está 100% apagado y cualquier parámetro del cliente se ignora.
+        self.assertFalse(_is_thinking_requested(req_default))
+        self.assertFalse(_is_thinking_requested(req_thinking_true))
+        self.assertFalse(_is_thinking_requested(req_high))
+
+        # 2. Si el usuario activa ENABLE_THINKING=true en .env en el futuro:
+        with patch("app.openai_routes.get_settings") as mock_settings:
+            mock_settings.return_value.enable_thinking = True
+            self.assertFalse(_is_thinking_requested(req_default))
+            self.assertTrue(_is_thinking_requested(req_thinking_true))
+            self.assertTrue(_is_thinking_requested(req_high))
 
 
 if __name__ == "__main__":

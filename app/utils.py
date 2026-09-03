@@ -300,29 +300,104 @@ def bootstrap_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return bootstrapped
 
 
+def extract_chunk_content_and_thought(sdk_chunk: Any) -> tuple[str, str]:
+    """
+    Extrae de forma limpia el texto de respuesta y el texto de pensamiento (thought/reasoning).
+    Retorna (content_piece, thought_piece).
+    """
+    if sdk_chunk is None:
+        return "", ""
+
+    # 1. Si el objeto tiene atributos Message de LiteRT-LM
+    if hasattr(sdk_chunk, "channels") and isinstance(sdk_chunk.channels, dict):
+        thought = str(sdk_chunk.channels.get("thought", "") or "")
+        content = ""
+        if hasattr(sdk_chunk, "text") and sdk_chunk.text:
+            content = str(sdk_chunk.text)
+        elif hasattr(sdk_chunk, "contents") and sdk_chunk.contents:
+            content = str(sdk_chunk.contents)
+        return content, thought
+
+    # 2. Si sdk_chunk es un dict
+    if isinstance(sdk_chunk, dict):
+        thought = ""
+        if "channels" in sdk_chunk and isinstance(sdk_chunk["channels"], dict):
+            thought = str(sdk_chunk["channels"].get("thought", "") or "")
+        elif "reasoning_content" in sdk_chunk:
+            thought = str(sdk_chunk.get("reasoning_content") or "")
+
+        content = ""
+        raw_content = sdk_chunk.get("content")
+        if isinstance(raw_content, str):
+            content = raw_content
+        elif isinstance(raw_content, list):
+            content = "".join(
+                item.get("text", "") if isinstance(item, dict) else str(item)
+                for item in raw_content
+            )
+        elif isinstance(raw_content, dict) and "text" in raw_content:
+            content = str(raw_content["text"])
+
+        return content, thought
+
+    # 3. Si sdk_chunk es un string
+    if isinstance(sdk_chunk, str):
+        trimmed = sdk_chunk.strip()
+        if trimmed.startswith("{") and trimmed.endswith("}") and ("channels" in trimmed or "reasoning_content" in trimmed):
+            try:
+                data = json.loads(trimmed)
+                if isinstance(data, dict):
+                    thought = ""
+                    if "channels" in data and isinstance(data["channels"], dict):
+                        thought = str(data["channels"].get("thought", "") or "")
+                    elif "reasoning_content" in data:
+                        thought = str(data.get("reasoning_content") or "")
+
+                    content = ""
+                    raw_content = data.get("content")
+                    if isinstance(raw_content, str):
+                        content = raw_content
+                    return content, thought
+            except Exception:
+                pass
+
+        return sdk_chunk, ""
+
+    if hasattr(sdk_chunk, "text"):
+        return str(sdk_chunk.text), ""
+
+    return "", ""
+
+
 def sdk_message_to_text(message: Any) -> str:
+    """Extrae el contenido textual de una respuesta del SDK, descartando canales de razonamiento."""
+    content, _ = extract_chunk_content_and_thought(message)
+    if content:
+        return content
+
     if isinstance(message, str):
+        trimmed = message.strip()
+        if trimmed.startswith("{") and trimmed.endswith("}") and ("channels" in trimmed or "reasoning_content" in trimmed):
+            return ""
         return message
 
     if isinstance(message, dict):
-        content = message.get("content")
-        if isinstance(content, str):
-            return content
-        if isinstance(content, list):
+        raw_content = message.get("content")
+        if isinstance(raw_content, str):
+            return raw_content
+        if isinstance(raw_content, list):
             parts: list[str] = []
-            for item in content:
+            for item in raw_content:
                 if isinstance(item, dict) and isinstance(item.get("text"), str):
                     parts.append(item["text"])
                 elif isinstance(item, str):
                     parts.append(item)
             return "".join(parts)
-        if isinstance(content, dict) and isinstance(content.get("text"), str):
-            return content["text"]
+        if isinstance(raw_content, dict) and isinstance(raw_content.get("text"), str):
+            return raw_content["text"]
+        return ""
 
     if hasattr(message, "text"):
         return str(message.text)
 
-    try:
-        return json.dumps(message, ensure_ascii=False)
-    except Exception:
-        return ""
+    return ""

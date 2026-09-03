@@ -49,8 +49,11 @@ class ChatCompletionRequest(BaseModel):
 
 
 class ChatCompletionMessage(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     role: Literal["assistant"] = "assistant"
     content: str | None = None
+    reasoning_content: str | None = None
     tool_calls: list[dict[str, Any]] | None = None
 
 

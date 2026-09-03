@@ -101,13 +101,21 @@ async def init_engine() -> Engine:
         if "max_num_tokens" in engine_signature.parameters and settings.max_num_tokens > 0:
             engine_kwargs["max_num_tokens"] = settings.max_num_tokens
 
-        # 3. Soporte multimodal controlado
-        if "max_num_images" in engine_signature.parameters:
-            engine_kwargs["max_num_images"] = settings.max_num_images
-        if settings.max_num_images > 0 and "vision_backend" in engine_signature.parameters:
-            engine_kwargs["vision_backend"] = Backend.CPU(thread_count=settings.cpu_threads)
+        # 3. Soporte multimodal estrictamente condicional:
+        # NUNCA pasar max_num_images ni vision_backend si max_num_images <= 0,
+        # para que LiteRT NO compile ni instancie las 3 resoluciones de vision
+        # (vision_140, vision_280, vision_70), los adaptadores y audio, lo cual ahorra > 1GB de RAM.
+        if settings.max_num_images > 0:
+            if "max_num_images" in engine_signature.parameters:
+                engine_kwargs["max_num_images"] = settings.max_num_images
+            if "vision_backend" in engine_signature.parameters:
+                engine_kwargs["vision_backend"] = Backend.CPU(thread_count=settings.cpu_threads)
 
-        # 4. Ringbuffers para atención local (específico para backend GPU)
+        # 4. YNNPACK (aceleración CPU nativa de LiteRT)
+        if "enable_ynnpack" in engine_signature.parameters:
+            engine_kwargs["enable_ynnpack"] = True
+
+        # 5. Ringbuffers para atención local (específico para backend GPU)
         is_gpu = isinstance(engine_kwargs.get("backend"), Backend.GPU)
         if is_gpu and "use_ringbuffers_local_attention" in engine_signature.parameters:
             engine_kwargs["use_ringbuffers_local_attention"] = settings.use_ringbuffers_local_attention

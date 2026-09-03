@@ -20,6 +20,8 @@ services:
       ENABLE_BENCHMARK: ${ENABLE_BENCHMARK:-false}
       ENABLE_ADMIN_LLM: ${ENABLE_ADMIN_LLM:-false}
       THINKING_TOKEN_BUDGET: ${THINKING_TOKEN_BUDGET:-384}
+      ENABLE_THINKING: ${ENABLE_THINKING:-false}
+      ENABLE_TOOLS: ${ENABLE_TOOLS:-true}
     ports:
       - "${HOST_PORT:-8005}:${SERVER_PORT:-8000}"
     volumes:

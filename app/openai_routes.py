@@ -33,6 +33,7 @@ from app.streaming import build_method_kwargs, create_chat_event_stream
 from app.utils import (
     bootstrap_messages,
     extract_api_key,
+    extract_chunk_content_and_thought,
     extract_incremental_message_payload,
     extract_tool_calls_from_text,
     format_tools_system_prompt,
@@ -46,48 +47,45 @@ router = APIRouter(prefix="/v1", tags=["openai-compatible"])
 
 
 def _is_thinking_requested(request: ChatCompletionRequest) -> bool:
-    """Verifica si OpenWebUI o el cliente solicitó razonamiento/thinking en los parámetros."""
+    """Verifica si el modo thinking está permitido por configuración y solicitado por el cliente."""
+    settings = get_settings()
+    if not settings.enable_thinking:
+        return False
+
+    # 1. Parámetro directo 'thinking'
     if request.thinking is not None:
         if isinstance(request.thinking, bool):
             return request.thinking
         if isinstance(request.thinking, dict):
             return request.thinking.get("type") in {"enabled", "true", True} or bool(request.thinking.get("enabled"))
         if isinstance(request.thinking, str):
-            return request.thinking.lower() in {"true", "enabled", "on", "1"}
+            return request.thinking.lower().strip() in {"true", "enabled", "on", "1"}
 
+    # 2. Parámetro 'reasoning_effort' de OpenAI
     if request.reasoning_effort is not None:
-        return str(request.reasoning_effort).lower() not in {"none", "off", "0", "false", ""}
+        effort = str(request.reasoning_effort).lower().strip()
+        if effort in {"low", "medium", "high"}:
+            return True
+        if effort in {"none", "off", "0", "false", "", "default", "auto", "null"}:
+            return False
 
-    if request.model_extra:
+    # 3. Solo si la configuración global permite thinking por defecto, revisar contenedores opcionales
+    if settings.enable_thinking and request.model_extra:
         for key in ["thinking", "thought", "reasoning", "enable_thinking"]:
             val = request.model_extra.get(key)
             if val is True or val == "true" or val == "True":
                 return True
-            if isinstance(val, str) and val.lower() in {"true", "enabled", "on", "1"}:
+            if isinstance(val, str) and val.lower().strip() in {"true", "enabled", "on", "1"}:
                 return True
             if isinstance(val, dict) and (val.get("type") in {"enabled", "true"} or val.get("enabled") is True):
                 return True
 
         if "reasoning_effort" in request.model_extra:
-            effort = str(request.model_extra["reasoning_effort"]).lower()
-            if effort not in {"none", "off", "0", "false", ""}:
+            effort = str(request.model_extra["reasoning_effort"]).lower().strip()
+            if effort in {"low", "medium", "high"}:
                 return True
-
-        for container_key in ["extra_body", "chat_options", "options", "custom_params", "params"]:
-            container = request.model_extra.get(container_key)
-            if isinstance(container, dict):
-                for key in ["thinking", "thought", "reasoning", "enable_thinking"]:
-                    val = container.get(key)
-                    if val is True or val == "true" or val == "True":
-                        return True
-                    if isinstance(val, str) and val.lower() in {"true", "enabled", "on", "1"}:
-                        return True
-                    if isinstance(val, dict) and (val.get("type") in {"enabled", "true"} or val.get("enabled") is True):
-                        return True
-                if "reasoning_effort" in container:
-                    effort = str(container["reasoning_effort"]).lower()
-                    if effort not in {"none", "off", "0", "false", ""}:
-                        return True
+            if effort in {"none", "off", "0", "false", "", "default", "auto", "null"}:
+                return False
 
     return False
 
@@ -111,6 +109,7 @@ async def chat_completions(
     raw_request: Request,
     authorization: str | None = Header(default=None),
 ) -> Response:
+    settings = get_settings()
     profile_store = get_profile_store()
 
     message_dicts = [
@@ -156,8 +155,12 @@ async def chat_completions(
     if thinking_override:
         logger.info("[THINKING] Modo thinking activado para conversación %s", conversation_id)
 
-    tools_system_prompt = format_tools_system_prompt(request.tools)
-    if tools_system_prompt:
+    tools_system_prompt = (
+        format_tools_system_prompt(request.tools)
+        if (settings.enable_tools and request.tools)
+        else ""
+    )
+    if tools_system_prompt and request.tools:
         logger.info("[TOOLS] %d herramientas inyectadas en la conversación %s", len(request.tools), conversation_id)
 
     bootstrap_system_prompt = profile_store.combined_bootstrap_system_prompt(
@@ -242,7 +245,10 @@ async def chat_completions(
             raise HTTPException(status_code=500, detail=str(exc)) from exc
 
         t_end = time.perf_counter()
-        response_text = sdk_message_to_text(sdk_response)
+        response_text, response_thought = extract_chunk_content_and_thought(sdk_response)
+        if not response_text and not response_thought:
+            response_text = sdk_message_to_text(sdk_response)
+
         await manager.register_turn(
             state,
             incremental_payload,
@@ -269,6 +275,7 @@ async def chat_completions(
             ChatCompletionChoice(
                 message=ChatCompletionMessage(
                     content=response_text if not extracted_tool_calls else None,
+                    reasoning_content=response_thought if response_thought else None,
                     tool_calls=extracted_tool_calls,
                 ),
                 finish_reason=finish_reason,

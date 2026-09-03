@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from app.config import get_settings
 from app.engine import get_engine
 
 logger = logging.getLogger(__name__)
@@ -38,12 +39,13 @@ def compute_usage_and_metrics(
     prompt_tokens = estimate_token_count(prompt_text)
     completion_tokens = estimate_token_count(response_text)
 
+    settings = get_settings()
     bench = None
-    try:
-        if hasattr(conversation, "get_benchmark_info"):
+    if settings.enable_benchmark and hasattr(conversation, "get_benchmark_info"):
+        try:
             bench = conversation.get_benchmark_info()
-    except Exception:
-        bench = None
+        except Exception:
+            bench = None
 
     total_duration_ns = int(max(0.001, t_end - t_start) * 1e9)
     load_duration_ns = int(bench.init_time_in_second * 1e9) if bench else 0

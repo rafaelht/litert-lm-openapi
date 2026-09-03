@@ -12,8 +12,11 @@ from fastapi import Request
 from app.conversation_manager import ConversationManager, ConversationState
 from app.engine import force_garbage_collection, update_engine_activity
 from app.metrics import compute_usage_and_metrics
-from app.schemas import ChatCompletionRequest
-from app.utils import extract_tool_calls_from_text, sdk_message_to_text
+from app.utils import (
+    extract_chunk_content_and_thought,
+    extract_tool_calls_from_text,
+    sdk_message_to_text,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -124,10 +127,33 @@ async def create_chat_event_stream(
                 update_engine_activity()
 
                 if not disconnected:
-                    text_piece = sdk_message_to_text(sdk_chunk)
-                    if not text_piece:
+                    content_piece, thought_piece = extract_chunk_content_and_thought(sdk_chunk)
+
+                    # 1. Si el modelo emitió razonamiento (thought/reasoning), emitirlo como reasoning_content
+                    if thought_piece:
+                        thought_payload = {
+                            "id": completion_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": request.model,
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "delta": {
+                                        "role": "assistant",
+                                        "reasoning_content": thought_piece,
+                                    },
+                                    "finish_reason": None,
+                                }
+                            ],
+                        }
+                        yield sse_data(thought_payload)
+
+                    # 2. Si hay texto normal de respuesta, procesarlo y emitirlo en content
+                    if not content_piece:
                         continue
-                    streamed_text_parts.append(text_piece)
+
+                    streamed_text_parts.append(content_piece)
                     accumulated = "".join(streamed_text_parts)
 
                     # Si hay una tool_call en progreso, retener el texto de la tool_call

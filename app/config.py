@@ -24,6 +24,8 @@ class Settings:
     enable_benchmark: bool
     enable_admin_llm: bool
     thinking_token_budget: int
+    enable_thinking: bool
+    enable_tools: bool
 
     @property
     def model_id(self) -> str:
@@ -64,4 +66,8 @@ def get_settings() -> Settings:
         enable_admin_llm=os.getenv("ENABLE_ADMIN_LLM", "false").lower()
         in {"true", "1", "yes"},
         thinking_token_budget=int(os.getenv("THINKING_TOKEN_BUDGET", "384")),
+        enable_thinking=os.getenv("ENABLE_THINKING", "false").lower()
+        in {"true", "1", "yes"},
+        enable_tools=os.getenv("ENABLE_TOOLS", "true").lower()
+        in {"true", "1", "yes"},
     )

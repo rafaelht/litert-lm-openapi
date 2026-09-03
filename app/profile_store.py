@@ -86,19 +86,9 @@ class ProfileStore:
             if msg.get("role") in {"system", "developer"}
         ).strip()
 
-        use_thinking = self._profile.thinking if thinking_override is None else thinking_override
-
-        thinking_block = ""
-        if use_thinking:
-            thinking_block = (
-                "Antes de responder, analiza y razona detalladamente paso a paso dentro de etiquetas <think>...</think>.\n"
-                "Una vez cerrado el bloque </think>, entrega tu respuesta final directamente."
-            )
-
         parts = [
             self._profile.system_prompt.strip(),
             self._render_profile_memory_block(),
-            thinking_block,
             request_system,
         ]
         return "\n\n".join(part for part in parts if part)
