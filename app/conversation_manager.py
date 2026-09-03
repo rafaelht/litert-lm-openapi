@@ -40,15 +40,9 @@ class ConversationManager:
         self._manager_lock = asyncio.Lock()
         self._rollover_threshold_tokens = max(1, self._settings.context_rollover_threshold_tokens)
         configured_recent = self._settings.context_rollover_recent_messages
-        self._rollover_recent_messages = min(3, max(1, configured_recent))
+        self._rollover_recent_messages = min(10, max(1, configured_recent))
         self._rollover_recent_token_budget = max(512, self._settings.context_rollover_recent_token_budget)
-        self._rollover_summary_token_budget = 96
-        if configured_recent != self._rollover_recent_messages:
-            logger.warning(
-                "CONTEXT_ROLLOVER_RECENT_MESSAGES=%s is out of supported range [1,3]; using %s",
-                configured_recent,
-                self._rollover_recent_messages,
-            )
+        self._rollover_summary_token_budget = 256
 
     async def get_or_create(
         self,
@@ -57,6 +51,7 @@ class ConversationManager:
         bootstrap_messages: list[dict[str, Any]],
         bootstrap_system_message: str | None = None,
         initialized_with_profile: bool = False,
+        thinking_enabled: bool = False,
     ) -> ConversationState:
         async with self._manager_lock:
             state = self._conversations.get(conversation_id)
@@ -66,26 +61,18 @@ class ConversationManager:
                 return state
 
             await self._evict_if_needed_locked()
-            logger.info("Creating new conversation: %s", conversation_id)
+            logger.info("Creating new conversation: %s (thinking=%s)", conversation_id, thinking_enabled)
             prepared_bootstrap_messages, bootstrap_summary, bootstrap_recent_messages = (
                 self._prepare_bootstrap_context(
                     bootstrap_messages=bootstrap_messages,
                     bootstrap_system_message=bootstrap_system_message or "",
                 )
             )
-            conversation_kwargs: dict[str, Any] = {"messages": prepared_bootstrap_messages}
-            try:
-                create_signature = inspect.signature(self._engine.create_conversation)
-                if bootstrap_system_message and "system_message" in create_signature.parameters:
-                    conversation_kwargs["system_message"] = bootstrap_system_message
-                if "filter_channel_content_from_kv_cache" in create_signature.parameters:
-                    conversation_kwargs["filter_channel_content_from_kv_cache"] = True
-            except (TypeError, ValueError):
-                pass
 
-            conversation = await asyncio.to_thread(
-                self._engine.create_conversation,
-                **conversation_kwargs,
+            conversation = await self._create_conversation(
+                bootstrap_messages=prepared_bootstrap_messages,
+                bootstrap_system_message=bootstrap_system_message,
+                thinking_enabled=thinking_enabled,
             )
             state = ConversationState(
                 conversation_id=conversation_id,
@@ -198,20 +185,26 @@ class ConversationManager:
         state.last_known_token_count = current_tokens
 
         # Garantizar margen suficiente para generación completa sin corte abrupto.
-        # Si thinking está activo, dejamos al menos 1800 tokens de margen (umbral 2200).
+        # Con max_num_tokens (ej. 4096):
+        # Si thinking está activo: reservamos margen para thinking_token_budget + 400 tokens de salida.
+        # Sin thinking: reservamos un margen cómodo de 650 tokens para la respuesta.
+        max_tokens = self._settings.max_num_tokens
+        headroom = (self._settings.thinking_token_budget + 400) if thinking_enabled else 650
         dynamic_threshold = min(
             self._rollover_threshold_tokens,
-            2200 if thinking_enabled else 3000,
+            max_tokens - headroom,
         )
 
         if projected_tokens <= dynamic_threshold:
             return
 
         logger.info(
-            "[ROLLOVER] Activando rollover preventivo (current=%d, incoming=%d, threshold=%d, thinking=%s) para %s",
+            "[ROLLOVER] Activando rollover preventivo (current=%d, incoming=%d, projected=%d, threshold=%d, max=%d, thinking=%s) para %s",
             current_tokens,
             incoming_tokens,
+            projected_tokens,
             dynamic_threshold,
+            max_tokens,
             thinking_enabled,
             state.conversation_id,
         )
@@ -219,6 +212,7 @@ class ConversationManager:
             state,
             current_tokens=current_tokens,
             projected_tokens=projected_tokens,
+            thinking_enabled=thinking_enabled,
         )
 
     async def register_turn(
@@ -232,7 +226,11 @@ class ConversationManager:
             state.rolling_messages.append(user_message)
         if assistant_text.strip():
             state.rolling_messages.append({"role": "assistant", "content": assistant_text})
-        state.rolling_messages = self._trim_recent_messages(state.rolling_messages)
+
+        # Mantener un historial amplio de turnos para resumir cuando se alcance el límite
+        if len(state.rolling_messages) > 40:
+            state.rolling_messages = state.rolling_messages[-40:]
+
         state.last_known_token_count = self._estimate_context_tokens(
             state.bootstrap_system_message,
             state.summary_text,
@@ -246,21 +244,38 @@ class ConversationManager:
         *,
         current_tokens: int,
         projected_tokens: int,
+        thinking_enabled: bool = False,
     ) -> None:
-        summary_text = await self._summarize_context(state)
+        # 1. Separar mensajes recientes de mensajes antiguos
         recent_messages = self._select_recent_messages(
             state.rolling_messages,
             self._rollover_recent_messages,
             self._rollover_recent_token_budget,
         )
+        recent_ids = {id(m) for m in recent_messages}
+        older_messages = [m for m in state.rolling_messages if id(m) not in recent_ids]
 
+        # 2. Generar resumen compacto de los mensajes antiguos + resumen previo
+        summary_text = await self._summarize_context(state, older_messages=older_messages)
         merged_summary = summary_text.strip() or state.summary_text.strip()
         compact_summary = self._compact_summary_text(merged_summary)
-        rollover_messages = self._build_rollover_messages(compact_summary, recent_messages)
 
+        # 3. Formatear el system prompt con la memoria resumida inyectada
+        base_system = state.bootstrap_system_message.strip()
+        if compact_summary:
+            memory_block = (
+                f"\n\n[Resumen del contexto previo de la conversación]:\n{compact_summary}\n"
+                "[Fin del resumen de contexto previo. Continúa respondiendo normalmente a los últimos mensajes.]"
+            )
+            rollover_system_prompt = f"{base_system}{memory_block}" if base_system else memory_block
+        else:
+            rollover_system_prompt = base_system
+
+        # 4. Crear la nueva conversación en LiteRT con KV-cache limpio (~300-500 tokens)
         new_conversation = await self._create_conversation(
-            bootstrap_messages=rollover_messages,
-            bootstrap_system_message=state.bootstrap_system_message,
+            bootstrap_messages=recent_messages,
+            bootstrap_system_message=rollover_system_prompt,
+            thinking_enabled=thinking_enabled,
         )
 
         old_conversation = state.conversation
@@ -278,14 +293,14 @@ class ConversationManager:
         force_garbage_collection()
 
         post_tokens = self._estimate_context_tokens(
-            state.bootstrap_system_message,
-            state.summary_text,
+            rollover_system_prompt,
+            "",
             state.rolling_messages,
         )
         state.last_known_token_count = post_tokens
 
-        logger.warning(
-            "Context rollover conversation=%s before_tokens=%s projected_tokens=%s after_tokens=%s recent_messages=%s rollovers=%s",
+        logger.info(
+            "[ROLLOVER COMPLETADO] conversación=%s antes=%d tokens, proyectado=%d, después=%d tokens, recientes=%d, rollovers=%d",
             state.conversation_id,
             current_tokens,
             projected_tokens,
@@ -294,10 +309,18 @@ class ConversationManager:
             state.rollover_count,
         )
 
-    async def _summarize_context(self, state: ConversationState) -> str:
-        transcript = self._messages_to_transcript(self._trim_recent_messages(state.rolling_messages))
+    async def _summarize_context(
+        self,
+        state: ConversationState,
+        older_messages: list[dict[str, Any]] | None = None,
+    ) -> str:
+        msgs_to_summarize = older_messages if older_messages is not None else state.rolling_messages
+        transcript = self._messages_to_transcript(msgs_to_summarize)
         if not transcript and state.summary_text.strip():
             return state.summary_text.strip()
+
+        if not self._settings.enable_admin_llm:
+            return self._build_structured_summary(msgs_to_summarize, state.summary_text)
 
         summary_prompt = self._build_summary_prompt(
             previous_summary=state.summary_text,
@@ -327,12 +350,35 @@ class ConversationManager:
                 try:
                     await asyncio.to_thread(summarizer_conversation.close)
                 except Exception:
-                    logger.exception("Error closing summarizer conversation for %s", state.conversation_id)
+                    pass
 
-        fallback = self._fallback_summary(state)
-        if fallback:
-            logger.warning("Using fallback summary during rollover for %s", state.conversation_id)
-        return fallback
+        return self._build_structured_summary(msgs_to_summarize, state.summary_text)
+
+    def _build_structured_summary(
+        self,
+        older_messages: list[dict[str, Any]],
+        previous_summary: str,
+    ) -> str:
+        summary_lines: list[str] = []
+        if previous_summary.strip():
+            summary_lines.append(f"Contexto previo acumulado: {previous_summary.strip()}")
+
+        topics: list[str] = []
+        for msg in older_messages:
+            if msg.get("role") == "user":
+                text = self._content_to_text(msg.get("content")).strip()
+                if text:
+                    first_line = text.splitlines()[0]
+                    words = first_line.split()[:14]
+                    topic = " ".join(words)
+                    if topic and topic not in topics:
+                        topics.append(topic)
+
+        if topics:
+            topics_str = " | ".join(topics[-8:])
+            summary_lines.append(f"Temas tratados: {topics_str}")
+
+        return "\n".join(summary_lines)
 
     def _build_summary_prompt(self, *, previous_summary: str, transcript: str) -> str:
         parts = [
@@ -349,23 +395,13 @@ class ConversationManager:
             parts.append(transcript.strip())
         return "\n\n".join(parts)
 
-    def _fallback_summary(self, state: ConversationState) -> str:
-        previous_summary = state.summary_text.strip()
-        transcript = self._messages_to_transcript(state.rolling_messages)
-        if not transcript:
-            return previous_summary
-
-        transcript_lines = transcript.splitlines()
-        tail = "\n".join(transcript_lines[-12:])
-        if previous_summary:
-            return f"{previous_summary}\n\nRecent context:\n{tail}".strip()
-        return f"Recent context:\n{tail}".strip()
 
     async def _create_conversation(
         self,
         *,
         bootstrap_messages: list[dict[str, Any]],
         bootstrap_system_message: str | None,
+        thinking_enabled: bool = False,
     ) -> Conversation:
         conversation_kwargs: dict[str, Any] = {"messages": bootstrap_messages}
         try:
@@ -374,6 +410,13 @@ class ConversationManager:
                 conversation_kwargs["system_message"] = bootstrap_system_message
             if "filter_channel_content_from_kv_cache" in create_signature.parameters:
                 conversation_kwargs["filter_channel_content_from_kv_cache"] = True
+            if thinking_enabled and "thinking_config" in create_signature.parameters:
+                from litert_lm.interfaces import ThinkingConfig
+
+                conversation_kwargs["thinking_config"] = ThinkingConfig(
+                    enable_thinking=True,
+                    thinking_token_budget=self._settings.thinking_token_budget,
+                )
         except (TypeError, ValueError):
             pass
 
@@ -625,6 +668,8 @@ class ConversationManager:
                 await asyncio.to_thread(state.conversation.close)
             except Exception:
                 logger.exception("Error closing conversation backend thread for %s", conversation_id)
+
+        force_garbage_collection()
 
     async def close_all(self) -> None:
         async with self._manager_lock:

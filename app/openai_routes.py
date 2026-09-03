@@ -1,20 +1,24 @@
 from __future__ import annotations
 
 import asyncio
-import inspect
-import json
 import logging
 import time
 import uuid
-from typing import Any, AsyncIterator
+from typing import Any
 
 from fastapi import APIRouter, Header, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
-from anyio import to_thread
 
+from app.admin_handlers import detect_admin_request, handle_admin_completion
 from app.config import get_settings
 from app.conversation_manager import get_conversation_manager
-from app.engine import get_engine, init_engine, update_engine_activity, check_and_consume_reload_flag, force_garbage_collection
+from app.engine import (
+    check_and_consume_reload_flag,
+    force_garbage_collection,
+    init_engine,
+    update_engine_activity,
+)
+from app.metrics import compute_usage_and_metrics
 from app.profile_store import get_profile_store
 from app.schemas import (
     ChatCompletionChoice,
@@ -25,6 +29,7 @@ from app.schemas import (
     OpenAIModel,
     OpenAIModelListResponse,
 )
+from app.streaming import build_method_kwargs, create_chat_event_stream
 from app.utils import (
     bootstrap_messages,
     extract_api_key,
@@ -40,146 +45,8 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/v1", tags=["openai-compatible"])
 
 
-def _build_method_kwargs(method: Any, generation_params: dict[str, Any]) -> dict[str, Any]:
-    if not generation_params:
-        return {}
-
-    params = dict(generation_params)
-    if "max_tokens" in params and "max_output_tokens" not in params:
-        params["max_output_tokens"] = params["max_tokens"]
-
-    try:
-        signature = inspect.signature(method)
-    except (TypeError, ValueError):
-        return {}
-
-    accepts_var_kwargs = any(
-        parameter.kind == inspect.Parameter.VAR_KEYWORD
-        for parameter in signature.parameters.values()
-    )
-    if accepts_var_kwargs:
-        return params
-
-    return {
-        key: value
-        for key, value in params.items()
-        if key in signature.parameters
-    }
-
-
-def _sse_data(payload: dict[str, Any] | str) -> str:
-    if isinstance(payload, str):
-        return f"data: {payload}\n\n"
-    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
-
-
-def _estimate_token_count(text: str) -> int:
-    if not text:
-        return 0
-
-    try:
-        engine = get_engine()
-        if engine is None:
-            return 0
-        tokens = engine.tokenize(text)
-        return len(tokens) if isinstance(tokens, list) else 0
-    except Exception:
-        return 0
-
-
-def _compute_usage_and_metrics(
-    conversation: Any,
-    prompt_text: str,
-    response_text: str,
-    t_start: float,
-    t_first_token: float | None,
-    t_end: float,
-) -> dict[str, Any]:
-    prompt_tokens = _estimate_token_count(prompt_text)
-    completion_tokens = _estimate_token_count(response_text)
-
-    bench = None
-    try:
-        if hasattr(conversation, "get_benchmark_info"):
-            bench = conversation.get_benchmark_info()
-    except Exception:
-        bench = None
-
-    total_duration_ns = int(max(0.001, t_end - t_start) * 1e9)
-    load_duration_ns = int(bench.init_time_in_second * 1e9) if bench else 0
-
-    if bench and bench.last_prefill_token_count > 0:
-        p_tokens = bench.last_prefill_token_count
-        p_duration_ns = int((p_tokens / max(0.1, bench.last_prefill_tokens_per_second)) * 1e9) if bench.last_prefill_tokens_per_second > 0 else 0
-    else:
-        p_tokens = prompt_tokens
-        if t_first_token is not None and t_first_token > t_start:
-            p_duration_ns = int((t_first_token - t_start) * 1e9)
-        else:
-            p_duration_ns = 0
-
-    if bench and bench.last_decode_token_count > 0:
-        c_tokens = bench.last_decode_token_count
-        c_duration_ns = int((c_tokens / max(0.1, bench.last_decode_tokens_per_second)) * 1e9) if bench.last_decode_tokens_per_second > 0 else 0
-    else:
-        c_tokens = completion_tokens
-        if t_first_token is not None:
-            c_duration_ns = int(max(0.001, t_end - t_first_token) * 1e9)
-        else:
-            c_duration_ns = total_duration_ns
-
-    final_prompt_tokens = prompt_tokens if prompt_tokens > 0 else p_tokens
-    final_completion_tokens = completion_tokens if completion_tokens > 0 else c_tokens
-
-    # Cálculo explícito de velocidad de tokens
-    eval_sec = max(0.001, c_duration_ns / 1e9)
-    tokens_per_sec = round(final_completion_tokens / eval_sec, 2)
-    prompt_sec = max(0.001, p_duration_ns / 1e9)
-    prompt_tokens_per_sec = round(final_prompt_tokens / prompt_sec, 2)
-
-    return {
-        "prompt_tokens": final_prompt_tokens,
-        "completion_tokens": final_completion_tokens,
-        "total_tokens": final_prompt_tokens + final_completion_tokens,
-        "prompt_eval_count": p_tokens,
-        "prompt_eval_duration": p_duration_ns,
-        "eval_count": c_tokens,
-        "eval_duration": c_duration_ns,
-        "total_duration": total_duration_ns,
-        "load_duration": load_duration_ns,
-        "tokens_per_second": tokens_per_sec,
-        "eval_rate": f"{tokens_per_sec} tokens/s",
-        "prompt_eval_rate": f"{prompt_tokens_per_sec} tokens/s",
-    }
-
-
-def _extract_title_from_response(raw_text: str) -> str:
-    """Extrae de manera robusta el título del JSON o texto retornado por el modelo."""
-    if not raw_text:
-        return "Conversación General"
-    
-    try:
-        data = json.loads(raw_text)
-        if isinstance(data, dict) and "title" in data:
-            return str(data["title"]).strip()
-    except Exception:
-        pass
-    
-    match = re.search(r'\"title\"\s*:\s*\"([^\"]+)\"', raw_text)
-    if match:
-        return match.group(1).strip()
-    
-    cleaned = re.sub(r'```(?:json)?|```', '', raw_text).strip()
-    lines = [line.strip() for line in cleaned.splitlines() if line.strip()]
-    if lines:
-        first = lines[0].replace('"', '').replace('{', '').replace('}', '').replace('title:', '').strip()
-        return first if first else "Conversación General"
-    return "Conversación General"
-
-
 def _is_thinking_requested(request: ChatCompletionRequest) -> bool:
     """Verifica si OpenWebUI o el cliente solicitó razonamiento/thinking en los parámetros."""
-    # 1. Parámetro directo 'thinking'
     if request.thinking is not None:
         if isinstance(request.thinking, bool):
             return request.thinking
@@ -188,13 +55,10 @@ def _is_thinking_requested(request: ChatCompletionRequest) -> bool:
         if isinstance(request.thinking, str):
             return request.thinking.lower() in {"true", "enabled", "on", "1"}
 
-    # 2. Parámetro 'reasoning_effort'
     if request.reasoning_effort is not None:
         return str(request.reasoning_effort).lower() not in {"none", "off", "0", "false", ""}
 
-    # 3. Parámetros extra enviados por OpenWebUI / extensiones
     if request.model_extra:
-        # Búsqueda directa en raíz de model_extra
         for key in ["thinking", "thought", "reasoning", "enable_thinking"]:
             val = request.model_extra.get(key)
             if val is True or val == "true" or val == "True":
@@ -203,13 +67,12 @@ def _is_thinking_requested(request: ChatCompletionRequest) -> bool:
                 return True
             if isinstance(val, dict) and (val.get("type") in {"enabled", "true"} or val.get("enabled") is True):
                 return True
-        
+
         if "reasoning_effort" in request.model_extra:
             effort = str(request.model_extra["reasoning_effort"]).lower()
             if effort not in {"none", "off", "0", "false", ""}:
                 return True
 
-        # Búsqueda en contenedores anidados comunes de OpenWebUI
         for container_key in ["extra_body", "chat_options", "options", "custom_params", "params"]:
             container = request.model_extra.get(container_key)
             if isinstance(container, dict):
@@ -227,28 +90,6 @@ def _is_thinking_requested(request: ChatCompletionRequest) -> bool:
                         return True
 
     return False
-
-
-def _generate_heuristic_title(prompt: str) -> str:
-    """Genera un título dinámico, limpio y ultra-rápido basado en el texto del usuario."""
-    if not prompt:
-        return "Conversación General"
-    
-    clean_text = prompt.replace('"', '').replace("'", "").replace("`", "").strip()
-    lines = [line.strip() for line in clean_text.splitlines() if line.strip()]
-    first_line = lines[0] if lines else clean_text
-
-    words = first_line.split()
-    if not words:
-        return "Conversación General"
-
-    title_words = words[:4]
-    title = " ".join(title_words)
-
-    if len(title) > 30:
-        title = title[:27] + "..."
-    
-    return title.strip().capitalize()
 
 
 @router.get("/models", response_model=OpenAIModelListResponse)
@@ -279,143 +120,41 @@ async def chat_completions(
     if not message_dicts:
         raise HTTPException(status_code=400, detail="messages must not be empty")
 
-    logger.info("[DEBUG] Payload messages count: %d", len(message_dicts))
-
     incremental_payload = extract_incremental_message_payload(message_dicts)
     if isinstance(incremental_payload, str):
         incremental_message = incremental_payload.strip()
     else:
         incremental_message = normalize_text_content(incremental_payload.get("content", "")).strip()
+
     completion_id = f"chatcmpl-{uuid.uuid4().hex}"
     created = int(time.time())
 
-    # 1. CORTOCIRCUITO: Intercepción de prompts administrativos (Títulos y Tags)
-    msg_lower = incremental_message.lower()
-    
-    is_title_req = (
-        "title" in msg_lower or 
-        "creative title" in msg_lower or
-        "phrase with an emoji" in msg_lower or
-        (request.max_tokens is not None and request.max_tokens <= 24)
+    # 1. Cortocircuito para peticiones administrativas de OpenWebUI (Títulos y Tags)
+    is_admin, admin_type = detect_admin_request(
+        message_dicts=message_dicts,
+        incremental_message=incremental_message,
+        max_tokens=request.max_tokens,
     )
-    
-    is_tags_req = (
-        "generate 1-3 broad tags" in msg_lower or
-        "tags for this conversation" in msg_lower or
-        (len(message_dicts) == 1 and "tags" in msg_lower)
-    )
+    if is_admin:
+        return await handle_admin_completion(
+            request=request,
+            req_type=admin_type,
+            message_dicts=message_dicts,
+            incremental_message=incremental_message,
+            created=created,
+            completion_id=completion_id,
+        )
 
-    if is_title_req or is_tags_req:
-        logger.info("[TITLE/TAGS] Procesando petición de título/tags de OpenWebUI.")
-        
-        if is_title_req:
-            chat_title = "Conversación General"
-            title_conv = None
-            try:
-                engine = await init_engine()
-                title_conv = engine.create_conversation(
-                    system_message='Eres un asistente que resume conversaciones. Genera un título muy conciso y creativo de 3 a 5 palabras con un emoji alusivo en formato JSON: {"title": "..."}.',
-                    max_output_tokens=25,
-                )
-                title_response = await asyncio.to_thread(
-                    title_conv.send_message,
-                    incremental_message,
-                )
-                raw_text = sdk_message_to_text(title_response)
-                chat_title = _extract_title_from_response(raw_text)
-                logger.info("[TITLE] Título generado por IA: %s", chat_title)
-            except Exception as e:
-                logger.warning("[TITLE ERROR] Falló generación de título por IA, usando heurística: %s", str(e))
-                chat_title = _generate_heuristic_title(incremental_message)
-            finally:
-                if title_conv is not None and hasattr(title_conv, "close"):
-                    try:
-                        title_conv.close()
-                    except Exception:
-                        pass
-                force_garbage_collection()
-            
-            mock_payload = {"title": chat_title}
-
-        else:
-            tags_conv = None
-            try:
-                engine = await init_engine()
-                tags_conv = engine.create_conversation(
-                    system_message='Genera 1 a 3 etiquetas muy breves en formato lista JSON: ["tag1", "tag2"].',
-                    max_output_tokens=20,
-                )
-                tags_response = await asyncio.to_thread(
-                    tags_conv.send_message,
-                    incremental_message,
-                )
-                raw_text = sdk_message_to_text(tags_response)
-                try:
-                    mock_payload = json.loads(raw_text)
-                    if not isinstance(mock_payload, list):
-                        mock_payload = [str(mock_payload)]
-                except Exception:
-                    mock_payload = ["General"]
-            except Exception as e:
-                logger.warning("[TAGS ERROR] Falló generación de tags: %s", str(e))
-                mock_payload = ["General"]
-            finally:
-                if tags_conv is not None and hasattr(tags_conv, "close"):
-                    try:
-                        tags_conv.close()
-                    except Exception:
-                        pass
-                force_garbage_collection()
-
-        mock_json = json.dumps(mock_payload, ensure_ascii=False)
-        
-        if request.stream:
-            async def static_stream() -> AsyncIterator[str]:
-                yield _sse_data({
-                    "id": completion_id,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": request.model,
-                    "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]
-                })
-                yield _sse_data({
-                    "id": completion_id,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": request.model,
-                    "choices": [{"index": 0, "delta": {"content": mock_json}, "finish_reason": "stop"}]
-                })
-                yield _sse_data("[DONE]")
-            return StreamingResponse(
-                static_stream(),
-                media_type="text/event-stream",
-                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
-            )
-        else:
-            return JSONResponse(content={
-                "id": completion_id,
-                "object": "chat.completion",
-                "created": created,
-                "model": request.model,
-                "choices": [{
-                    "index": 0,
-                    "message": {"role": "assistant", "content": mock_json},
-                    "finish_reason": "stop"
-                }]
-            })
-
-    # 2. FLUJO NORMAL DE CONVERSACIÓN (Aislado y Protegido)
-    
-    # Asegurar recarga transparente del motor si fue removido por inactividad
+    # 2. Flujo normal de conversación
     engine_instance = await init_engine()
 
     api_key = extract_api_key(authorization)
     conversation_id = make_conversation_id(api_key, request.model, message_dicts)
     manager = get_conversation_manager()
-    
+
     thinking_override = _is_thinking_requested(request)
     if thinking_override:
-        logger.info("[THINKING] Modo thinking activado por parámetros para conversación %s", conversation_id)
+        logger.info("[THINKING] Modo thinking activado para conversación %s", conversation_id)
 
     tools_system_prompt = format_tools_system_prompt(request.tools)
     if tools_system_prompt:
@@ -426,17 +165,19 @@ async def chat_completions(
         thinking_override=thinking_override,
     )
     if tools_system_prompt:
-        bootstrap_system_prompt = f"{bootstrap_system_prompt}\n\n{tools_system_prompt}" if bootstrap_system_prompt else tools_system_prompt
+        bootstrap_system_prompt = (
+            f"{bootstrap_system_prompt}\n\n{tools_system_prompt}"
+            if bootstrap_system_prompt
+            else tools_system_prompt
+        )
 
     effective_generation_params = profile_store.effective_generation_params(request)
 
-    # Si el motor se recreó, actualizar referencias internas y limpiar el caché
+    # Si el motor se recreó, actualizar referencias internas y limpiar estado previo
     if check_and_consume_reload_flag():
         logger.info("Detectada recarga del Engine. Limpiando y reasignando referencias de C++.")
-        
         if hasattr(manager, "_engine"):
             manager._engine = engine_instance
-            
         if hasattr(manager, "_conversations"):
             manager._conversations.clear()
         elif hasattr(manager, "clear"):
@@ -447,227 +188,27 @@ async def chat_completions(
         bootstrap_messages=bootstrap_messages(message_dicts),
         bootstrap_system_message=bootstrap_system_prompt,
         initialized_with_profile=True,
+        thinking_enabled=bool(thinking_override),
     )
 
-    if effective_generation_params:
-        logger.info(
-            "Effective generation params for conversation %s: %s",
-            conversation_id,
-            sorted(effective_generation_params.keys()),
-        )
-    
     update_engine_activity()
-
     prompt_text = "\n".join(normalize_text_content(msg.get("content")) for msg in message_dicts)
 
+    # Streaming SSE
     if request.stream:
-
-        async def event_stream() -> AsyncIterator[str]:
-            t_start = time.perf_counter()
-            t_first_token: float | None = None
-            streamed_text_parts: list[str] = []
-
-            async with state.lock:
-                state.touch()
-                update_engine_activity()
-                await manager.prepare_for_turn(
-                    state,
-                    incremental_payload,
-                    thinking_enabled=bool(thinking_override),
-                )
-
-                first_chunk = {
-                    "id": completion_id,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": request.model,
-                    "choices": [
-                        {
-                            "index": 0,
-                            "delta": {"role": "assistant"},
-                            "finish_reason": None,
-                        }
-                    ],
-                }
-                yield _sse_data(first_chunk)
-
-                try:
-                    send_kwargs = _build_method_kwargs(
-                        state.conversation.send_message_async,
-                        effective_generation_params,
-                    )
-                    iterator = state.conversation.send_message_async(
-                        incremental_payload,
-                        **send_kwargs,
-                    )
-                    
-                    yielded_len = 0
-                    tool_tag_prefix = "<tool_call>"
-
-                    while True:
-                        disconnected = await raw_request.is_disconnected()
-
-                        try:
-                            sdk_chunk = await to_thread.run_sync(next, iterator, None)
-                            if sdk_chunk is None:
-                                break
-                        except StopIteration:
-                            break
-
-                        if t_first_token is None:
-                            t_first_token = time.perf_counter()
-
-                        state.touch()
-                        update_engine_activity()
-                        
-                        if not disconnected:
-                            text_piece = sdk_message_to_text(sdk_chunk)
-                            if not text_piece:
-                                continue
-                            streamed_text_parts.append(text_piece)
-                            accumulated = "".join(streamed_text_parts)
-
-                            # Si hay una tool_call en progreso, retener el texto de la tool_call
-                            if "<tool_call>" in accumulated:
-                                before_tool = accumulated.split("<tool_call>", 1)[0]
-                                if len(before_tool) > yielded_len:
-                                    delta_text = before_tool[yielded_len:]
-                                    yielded_len = len(before_tool)
-                                    payload = {
-                                        "id": completion_id,
-                                        "object": "chat.completion.chunk",
-                                        "created": created,
-                                        "model": request.model,
-                                        "choices": [{"index": 0, "delta": {"content": delta_text}, "finish_reason": None}],
-                                    }
-                                    yield _sse_data(payload)
-                            else:
-                                # Comprobar si el final de la cadena coincide con el inicio de '<tool_call>'
-                                tail_len = 0
-                                for i in range(len(tool_tag_prefix) - 1, 0, -1):
-                                    if accumulated.endswith(tool_tag_prefix[:i]):
-                                        tail_len = i
-                                        break
-                                
-                                safe_end = len(accumulated) - tail_len
-                                if safe_end > yielded_len:
-                                    delta_text = accumulated[yielded_len:safe_end]
-                                    yielded_len = safe_end
-                                    payload = {
-                                        "id": completion_id,
-                                        "object": "chat.completion.chunk",
-                                        "created": created,
-                                        "model": request.model,
-                                        "choices": [{"index": 0, "delta": {"content": delta_text}, "finish_reason": None}],
-                                    }
-                                    yield _sse_data(payload)
-
-                    # Al finalizar el stream, emitir cualquier texto restante si no era una tool_call
-                    accumulated = "".join(streamed_text_parts)
-                    if "<tool_call>" not in accumulated and len(accumulated) > yielded_len:
-                        delta_text = accumulated[yielded_len:]
-                        yielded_len = len(accumulated)
-                        payload = {
-                            "id": completion_id,
-                            "object": "chat.completion.chunk",
-                            "created": created,
-                            "model": request.model,
-                            "choices": [{"index": 0, "delta": {"content": delta_text}, "finish_reason": None}],
-                        }
-                        yield _sse_data(payload)
-
-                    t_end = time.perf_counter()
-                    full_response = accumulated
-                    await manager.register_turn(
-                        state,
-                        incremental_payload,
-                        full_response,
-                    )
-                        
-                except Exception as exc:
-                    t_end = time.perf_counter()
-                    logger.exception("Streaming failed for conversation %s", conversation_id)
-                    err_payload = {
-                        "error": {
-                            "message": str(exc),
-                            "type": "internal_error",
-                            "code": None,
-                        }
-                    }
-                    yield _sse_data(err_payload)
-
-                full_response = "".join(streamed_text_parts)
-                usage_dict = _compute_usage_and_metrics(
-                    state.conversation,
-                    prompt_text,
-                    full_response,
-                    t_start,
-                    t_first_token,
-                    t_end,
-                )
-
-                full_response = "".join(streamed_text_parts)
-                extracted_tool_calls = extract_tool_calls_from_text(full_response)
-                finish_reason = "tool_calls" if extracted_tool_calls else "stop"
-
-                if extracted_tool_calls:
-                    logger.info("[TOOLS] Despachando llamada a tool para OpenWebUI: %s", extracted_tool_calls)
-                    tool_chunk = {
-                        "id": completion_id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": request.model,
-                        "choices": [
-                            {
-                                "index": 0,
-                                "delta": {"tool_calls": extracted_tool_calls},
-                                "finish_reason": None,
-                            }
-                        ],
-                    }
-                    yield _sse_data(tool_chunk)
-
-                final_chunk = {
-                    "id": completion_id,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": request.model,
-                    "choices": [
-                        {
-                            "index": 0,
-                            "delta": {},
-                            "finish_reason": finish_reason,
-                        }
-                    ],
-                    "usage": usage_dict,
-                    "prompt_eval_count": usage_dict.get("prompt_eval_count"),
-                    "prompt_eval_duration": usage_dict.get("prompt_eval_duration"),
-                    "eval_count": usage_dict.get("eval_count"),
-                    "eval_duration": usage_dict.get("eval_duration"),
-                    "total_duration": usage_dict.get("total_duration"),
-                }
-                yield _sse_data(final_chunk)
-
-                # Chunk explícito de uso (OpenAI stream_options)
-                usage_chunk = {
-                    "id": completion_id,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": request.model,
-                    "choices": [],
-                    "usage": usage_dict,
-                    "prompt_eval_count": usage_dict.get("prompt_eval_count"),
-                    "prompt_eval_duration": usage_dict.get("prompt_eval_duration"),
-                    "eval_count": usage_dict.get("eval_count"),
-                    "eval_duration": usage_dict.get("eval_duration"),
-                    "total_duration": usage_dict.get("total_duration"),
-                }
-                yield _sse_data(usage_chunk)
-                yield _sse_data("[DONE]")
-                force_garbage_collection()
-
         return StreamingResponse(
-            event_stream(),
+            create_chat_event_stream(
+                request=request,
+                raw_request=raw_request,
+                state=state,
+                manager=manager,
+                incremental_payload=incremental_payload,
+                effective_generation_params=effective_generation_params,
+                completion_id=completion_id,
+                created=created,
+                thinking_override=thinking_override,
+                prompt_text=prompt_text,
+            ),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
@@ -687,7 +228,7 @@ async def chat_completions(
                 incremental_payload,
                 thinking_enabled=bool(thinking_override),
             )
-            send_kwargs = _build_method_kwargs(
+            send_kwargs = build_method_kwargs(
                 state.conversation.send_message,
                 effective_generation_params,
             )
@@ -699,7 +240,7 @@ async def chat_completions(
         except Exception as exc:
             logger.exception("Completion failed for conversation %s", conversation_id)
             raise HTTPException(status_code=500, detail=str(exc)) from exc
-        
+
         t_end = time.perf_counter()
         response_text = sdk_message_to_text(sdk_response)
         await manager.register_turn(
@@ -708,7 +249,7 @@ async def chat_completions(
             response_text,
         )
 
-    usage_dict = _compute_usage_and_metrics(
+    usage_dict = compute_usage_and_metrics(
         state.conversation,
         prompt_text,
         response_text,

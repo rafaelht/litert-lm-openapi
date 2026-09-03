@@ -51,9 +51,15 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
 
     await init_profile_store()
 
-    engine = await init_engine()
-    await init_conversation_manager(engine)
-    _cleanup_task = asyncio.create_task(_cleanup_loop())
+    try:
+        engine = await init_engine()
+        await init_conversation_manager(engine)
+        _cleanup_task = asyncio.create_task(_cleanup_loop())
+    except Exception as exc:
+        logger.warning(
+            "No se pudo pre-cargar el modelo en startup (%s). Se inicializará en la primera petición.",
+            exc,
+        )
 
     try:
         yield
