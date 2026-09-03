@@ -97,8 +97,19 @@ async def init_engine() -> Engine:
         if "backend" in engine_signature.parameters:
             engine_kwargs["backend"] = Backend.CPU(thread_count=settings.cpu_threads)
 
-        # 2. Límite del KV Cache en C++
-        if "max_num_tokens" in engine_signature.parameters and settings.max_num_tokens > 0:
+        # 2. Asignación del KV Cache en C++ (Dinámica mmap vs Estática)
+        # NOTA DE RENDIMIENTO Y MEMORIA:
+        # Si se pasa max_num_tokens a Engine.__init__, LiteRT-LM reescribe y reasigna
+        # 1.424 tensores en C++ (magic_number_utils), rompiendo el mmap de solo lectura
+        # del archivo y precargando 1.9GB de RAM.
+        # Por defecto (force_static_max_tokens=False), LiteRT usa su gestión dinámica mmap
+        # manteniendo la memoria física en solo ~400MB-500MB. El rollover a 4096 tokens
+        # se gestiona de forma continua y limpia en Python sin inflar la RAM.
+        if (
+            settings.force_static_max_tokens
+            and "max_num_tokens" in engine_signature.parameters
+            and settings.max_num_tokens > 0
+        ):
             engine_kwargs["max_num_tokens"] = settings.max_num_tokens
 
         # 3. Soporte multimodal estrictamente condicional:

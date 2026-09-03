@@ -27,13 +27,27 @@ class TestServerOptimizations(unittest.TestCase):
         self.assertEqual(settings.thinking_token_budget, 384)
         self.assertEqual(settings.context_rollover_threshold_tokens, 3400)
         self.assertFalse(settings.enable_thinking)
-        self.assertTrue(settings.enable_tools)
+        self.assertFalse(settings.enable_tools)
+        self.assertFalse(settings.force_static_max_tokens)
 
     def test_heuristic_title_generation(self):
         # Texto limpio estándar
         title1 = generate_heuristic_title("¿Cómo funciona el motor de un avión comercial?")
         self.assertIn("Cómo", title1)
         self.assertTrue(len(title1) <= 35)
+
+        # Plantilla compleja de OpenWebUI con Task, Chat, User y Assistant
+        openwebui_prompt = (
+            "### Task:\n"
+            "Generate a short 3-5 word title for the following conversation:\n"
+            "### Chat:\n"
+            "User: ¿Cómo funciona un avión?\n"
+            "Assistant: Un avión funciona gracias a la sustentación"
+        )
+        title_owui = generate_heuristic_title(openwebui_prompt)
+        self.assertNotIn("task", title_owui.lower())
+        self.assertNotIn("###", title_owui)
+        self.assertIn("Cómo funciona un avión", title_owui)
 
         # Prompt con prefijo administrativo
         title2 = generate_heuristic_title("Task: explain quantum computing")

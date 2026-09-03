@@ -26,6 +26,7 @@ class Settings:
     thinking_token_budget: int
     enable_thinking: bool
     enable_tools: bool
+    force_static_max_tokens: bool
 
     @property
     def model_id(self) -> str:
@@ -68,6 +69,8 @@ def get_settings() -> Settings:
         thinking_token_budget=int(os.getenv("THINKING_TOKEN_BUDGET", "384")),
         enable_thinking=os.getenv("ENABLE_THINKING", "false").lower()
         in {"true", "1", "yes"},
-        enable_tools=os.getenv("ENABLE_TOOLS", "true").lower()
+        enable_tools=os.getenv("ENABLE_TOOLS", "false").lower()
+        in {"true", "1", "yes"},
+        force_static_max_tokens=os.getenv("FORCE_STATIC_MAX_TOKENS", "false").lower()
         in {"true", "1", "yes"},
     )

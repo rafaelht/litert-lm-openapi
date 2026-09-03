@@ -23,9 +23,42 @@ def generate_heuristic_title(prompt: str) -> str:
         return "Conversación General"
 
     clean_text = prompt.replace('"', "").replace("'", "").replace("`", "").strip()
-    # Limpiar posibles prefijos de plantilla o signos de interrogación iniciales
-    clean_text = re.sub(r"^[¿¡\s]+", "", clean_text)
-    clean_text = re.sub(r"^(task:|user:|prompt:)\s*", "", clean_text, flags=re.IGNORECASE).strip()
+
+    # 1. Extraer la consulta real del usuario si viene dentro de una plantilla de OpenWebUI
+    user_match = re.search(
+        r"(?:user|human|usuario):\s*([^\n\r]+)", clean_text, flags=re.IGNORECASE
+    )
+    if user_match:
+        clean_text = user_match.group(1).strip()
+    else:
+        # Filtrar líneas con prefijos de plantilla administrativa de OpenWebUI
+        valid_lines: list[str] = []
+        for line in clean_text.splitlines():
+            line_str = line.strip()
+            if not line_str:
+                continue
+            lower = line_str.lower()
+            if lower.startswith(
+                (
+                    "###",
+                    "task:",
+                    "chat:",
+                    "generate",
+                    "create a",
+                    "summarize",
+                    "title:",
+                    "user:",
+                )
+            ):
+                continue
+            valid_lines.append(line_str)
+        clean_text = valid_lines[0] if valid_lines else clean_text
+
+    # 2. Limpiar posibles prefijos de plantilla o signos de puntuación iniciales
+    clean_text = re.sub(r"^[#¿¡\s\-*]+", "", clean_text)
+    clean_text = re.sub(
+        r"^(task:|user:|prompt:)\s*", "", clean_text, flags=re.IGNORECASE
+    ).strip()
 
     lines = [line.strip() for line in clean_text.splitlines() if line.strip()]
     first_line = lines[0] if lines else clean_text
@@ -40,7 +73,8 @@ def generate_heuristic_title(prompt: str) -> str:
     if len(title) > 35:
         title = title[:32] + "..."
 
-    return title.strip().capitalize()
+    title = re.sub(r"[:;,.-]+$", "", title).strip()
+    return title.capitalize() if title else "Conversación General"
 
 
 def generate_heuristic_tags(prompt: str) -> list[str]:
@@ -130,8 +164,17 @@ def _extract_user_context(message_dicts: list[dict[str, Any]]) -> str:
     for msg in reversed(message_dicts):
         role = msg.get("role")
         content = normalize_text_content(msg.get("content", ""))
-        if role == "user" and content and not any(k in content.lower() for k in ["generate a concise", "task:", "{{prompt"]):
-            return content
+        if role == "user" and content:
+            user_match = re.search(
+                r"(?:user|human|usuario):\s*([^\n\r]+)", content, flags=re.IGNORECASE
+            )
+            if user_match:
+                return user_match.group(1).strip()
+            if not any(
+                k in content.lower()
+                for k in ["generate a concise", "task:", "{{prompt", "### task"]
+            ):
+                return content
     if message_dicts:
         return normalize_text_content(message_dicts[0].get("content", ""))
     return ""
