@@ -27,6 +27,8 @@ class Settings:
     enable_thinking: bool
     enable_tools: bool
     force_static_max_tokens: bool
+    engine_ttl: int = 0
+    context_rollover_headroom_tokens: int = 1500
 
     @property
     def model_id(self) -> str:
@@ -46,7 +48,7 @@ def get_settings() -> Settings:
         max_active_conversations=int(os.getenv("MAX_ACTIVE_CONVERSATIONS", "2")),
         max_num_images=int(os.getenv("MAX_NUM_IMAGES", "0")),
         context_rollover_threshold_tokens=int(
-            os.getenv("CONTEXT_ROLLOVER_THRESHOLD_TOKENS", "3400")
+            os.getenv("CONTEXT_ROLLOVER_THRESHOLD_TOKENS", "2600")
         ),
         context_rollover_recent_messages=int(
             os.getenv("CONTEXT_ROLLOVER_RECENT_MESSAGES", "4")
@@ -73,4 +75,8 @@ def get_settings() -> Settings:
         in {"true", "1", "yes"},
         force_static_max_tokens=os.getenv("FORCE_STATIC_MAX_TOKENS", "false").lower()
         in {"true", "1", "yes"},
+        engine_ttl=int(os.getenv("ENGINE_TTL", "0")),
+        context_rollover_headroom_tokens=int(
+            os.getenv("CONTEXT_ROLLOVER_HEADROOM_TOKENS", "1500")
+        ),
     )

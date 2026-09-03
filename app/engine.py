@@ -67,27 +67,41 @@ def update_engine_activity() -> None:
 
 
 async def _monitor_inactivity() -> None:
-    """Loop en segundo plano que descarga el modelo si expira el TTL."""
+    """Loop en segundo plano que descarga el modelo si expira el TTL (solo si ENGINE_TTL > 0)."""
     global _engine
     settings = get_settings()
-    ttl = max(60, settings.session_timeout)
+    ttl = settings.engine_ttl
+    if ttl <= 0:
+        # Por defecto, el motor permanece cargado en RAM permanentemente para máxima velocidad
+        # y para evitar fugas de memoria por recargas cíclicas de C++.
+        return
 
     while _engine is not None:
-        await asyncio.sleep(15)  # Verificación periódica para precisión
-        
+        await asyncio.sleep(15)
+
         async with _engine_lock:
             if _engine is None:
                 break
-            
+
             elapsed = time.time() - _last_active_time
             if elapsed >= ttl:
                 logger.info("TTL de inactividad alcanzado (%ds). Descargando LiteRT de la RAM...", ttl)
-                
+
+                # CRÍTICO: Cerrar todas las sesiones de conversación en C++ antes de destruir el engine.
+                # De lo contrario, C++ lanza 'EngineAdvancedImpl destructed with living sessions!'
+                # y retiene la memoria antigua en RAM provocando que la RAM suba a 2.6GB.
+                try:
+                    from app.conversation_manager import get_conversation_manager
+                    manager = get_conversation_manager()
+                    await manager.close_all()
+                except Exception:
+                    logger.exception("Error cerrando conversaciones antes de liberar engine")
+
                 engine = _engine
                 _engine = None
                 await asyncio.to_thread(engine.close)
                 logger.info("LiteRT engine liberado automáticamente por inactividad.")
-                
+
                 force_garbage_collection()
                 break
 

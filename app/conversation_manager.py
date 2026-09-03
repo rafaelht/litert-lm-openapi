@@ -186,10 +186,12 @@ class ConversationManager:
 
         # Garantizar margen suficiente para generación completa sin corte abrupto.
         # Con max_num_tokens (ej. 4096):
-        # Si thinking está activo: reservamos margen para thinking_token_budget + 400 tokens de salida.
-        # Sin thinking: reservamos un margen cómodo de 650 tokens para la respuesta.
+        # Si thinking está activo: reservamos thinking_token_budget + headroom.
+        # Sin thinking: reservamos un margen holgado de generación (context_rollover_headroom_tokens, default 1500 tokens)
+        # para que respuestas largas de código o explicaciones extensas NUNCA se corten a mitad de camino.
         max_tokens = self._settings.max_num_tokens
-        headroom = (self._settings.thinking_token_budget + 400) if thinking_enabled else 650
+        base_headroom = getattr(self._settings, "context_rollover_headroom_tokens", 1500)
+        headroom = (self._settings.thinking_token_budget + base_headroom) if thinking_enabled else base_headroom
         dynamic_threshold = min(
             self._rollover_threshold_tokens,
             max_tokens - headroom,
