@@ -23,7 +23,7 @@ class TestServerOptimizations(unittest.TestCase):
         self.assertTrue(settings.use_ringbuffers_local_attention)
         self.assertFalse(settings.enable_benchmark)
         self.assertFalse(settings.enable_admin_llm)
-        self.assertEqual(settings.max_active_conversations, 5)
+        self.assertEqual(settings.max_active_conversations, 2)
         self.assertEqual(settings.thinking_token_budget, 384)
         self.assertEqual(settings.context_rollover_threshold_tokens, 3400)
         self.assertFalse(settings.enable_thinking)
