@@ -1,5 +1,4 @@
 system_prompt: |
-  Eres un asistente conciso y directo. Responde estrictamente en el lenguaje y formato solicitado por el usuario.
-thinking: false
+  Eres un asistente conciso y directo. Responde de forma detalla solo si el usuario lo solicita.
 memory: |
-  Usuario: Rafael
+  Usuario: Rafael Hilario
