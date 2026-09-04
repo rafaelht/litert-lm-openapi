@@ -62,18 +62,7 @@ class ProfileStore:
         memory_text = self._profile.memory_as_text()
         if not memory_text:
             return ""
-
-        return "\n".join(
-            [
-                "Persistent profile memory:",
-                "Use this only as background context.",
-                "Do not present it as the topic of the current conversation.",
-                "Do not mention or summarize it unless the user asks for it or it is directly relevant to the answer.",
-                "<profile_memory>",
-                memory_text,
-                "</profile_memory>",
-            ]
-        )
+        return f"Contexto de usuario: {memory_text}"
 
     def combined_bootstrap_system_prompt(
         self,

@@ -26,33 +26,16 @@ _last_active_time: float = 0.0
 _cleanup_task: Optional[asyncio.Task] = None
 
 _libc = None
-_libjemalloc = None
 if sys.platform == "linux":
     try:
         _libc = ctypes.CDLL("libc.so.6")
     except Exception:
         _libc = None
 
-    for libname in [
-        "/usr/lib/x86_64-linux-gnu/libjemalloc.so.2",
-        "libjemalloc.so.2",
-        "libjemalloc.so",
-    ]:
-        try:
-            _libjemalloc = ctypes.CDLL(libname)
-            break
-        except Exception:
-            pass
-
 
 def force_garbage_collection() -> None:
-    """Fuerza al recolector de basura de Python, jemalloc y glibc a devolver memoria física (RSS) al kernel."""
+    """Fuerza al recolector de basura de Python y a glibc (en Linux) a devolver memoria física al OS."""
     gc.collect()
-    if _libjemalloc is not None:
-        try:
-            _libjemalloc.mallctl(b"arenas.purge", None, None, None, 0)
-        except Exception:
-            pass
     if _libc is not None:
         try:
             _libc.malloc_trim(0)
@@ -152,10 +135,6 @@ async def init_engine() -> Engine:
                 engine_kwargs["max_num_images"] = settings.max_num_images
             if "vision_backend" in engine_signature.parameters:
                 engine_kwargs["vision_backend"] = Backend.CPU(thread_count=settings.cpu_threads)
-
-        # 4. YNNPACK (aceleración CPU nativa de LiteRT)
-        if "enable_ynnpack" in engine_signature.parameters:
-            engine_kwargs["enable_ynnpack"] = True
 
         # 5. Ringbuffers para atención local (específico para backend GPU)
         is_gpu = isinstance(engine_kwargs.get("backend"), Backend.GPU)
