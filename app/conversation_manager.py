@@ -428,18 +428,13 @@ class ConversationManager:
                 conversation_kwargs["system_message"] = bootstrap_system_message
             if "filter_channel_content_from_kv_cache" in create_signature.parameters:
                 conversation_kwargs["filter_channel_content_from_kv_cache"] = True
-            if "thinking_config" in create_signature.parameters:
+            if thinking_enabled and "thinking_config" in create_signature.parameters:
                 from litert_lm.interfaces import ThinkingConfig
 
-                if thinking_enabled:
-                    conversation_kwargs["thinking_config"] = ThinkingConfig(
-                        enable_thinking=True,
-                        thinking_token_budget=self._settings.thinking_token_budget,
-                    )
-                else:
-                    conversation_kwargs["thinking_config"] = ThinkingConfig(
-                        enable_thinking=False,
-                    )
+                conversation_kwargs["thinking_config"] = ThinkingConfig(
+                    enable_thinking=True,
+                    thinking_token_budget=self._settings.thinking_token_budget,
+                )
             if "sampler_config" in create_signature.parameters:
                 try:
                     from app.profile_store import get_profile_store
