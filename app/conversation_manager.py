@@ -283,19 +283,12 @@ class ConversationManager:
         else:
             rollover_system_prompt = base_system
 
-        # 4. Crear la nueva conversación en LiteRT con KV-cache limpio (~300-500 tokens)
-        new_conversation = await self._create_conversation(
-            bootstrap_messages=recent_messages,
-            bootstrap_system_message=rollover_system_prompt,
-            thinking_enabled=thinking_enabled,
-        )
-
+        # 4. CRÍTICO PARA EVITAR OOM EN LÍMITE DE 3 GB:
+        # Cerrar y destruir la conversación previa en C++ y forzar garbage collection
+        # ANTES de instanciar la nueva. Si se crea la nueva antes de cerrar la antigua,
+        # coexisten dos KV-caches masivos en RAM superando los 3.5 GB y congelando el NAS.
         old_conversation = state.conversation
-        state.conversation = new_conversation
-        state.summary_text = compact_summary
-        state.rolling_messages = list(recent_messages)
-        state.rollover_count += 1
-
+        state.conversation = None
         if hasattr(old_conversation, "close"):
             try:
                 await asyncio.to_thread(old_conversation.close)
@@ -303,6 +296,19 @@ class ConversationManager:
                 logger.exception("Error closing old conversation during rollover for %s", state.conversation_id)
 
         force_garbage_collection()
+
+        # 5. Crear la nueva conversación en LiteRT con KV-cache limpio (~300-500 tokens)
+        new_conversation = await self._create_conversation(
+            bootstrap_messages=recent_messages,
+            bootstrap_system_message=rollover_system_prompt,
+            thinking_enabled=thinking_enabled,
+        )
+
+        state.conversation = new_conversation
+        state.summary_text = compact_summary
+        state.rolling_messages = list(recent_messages)
+        state.rollover_count += 1
+
 
         post_tokens = self._estimate_context_tokens(
             rollover_system_prompt,

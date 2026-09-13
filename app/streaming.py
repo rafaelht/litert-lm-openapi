@@ -42,10 +42,13 @@ def build_method_kwargs(method: Any, generation_params: dict[str, Any]) -> dict[
     except (TypeError, ValueError):
         return {}
 
-    # 1. Adaptar max_output_tokens
+    # 1. Adaptar max_output_tokens con límite de seguridad por turno
     max_tokens = params.get("max_tokens") or params.get("max_output_tokens")
-    if max_tokens and "max_output_tokens" in signature.parameters:
-        result_kwargs["max_output_tokens"] = max_tokens
+    if not max_tokens or int(max_tokens) <= 0:
+        # Límite por turno para evitar que respuestas fuera de control devoren la memoria RAM
+        max_tokens = 1024
+    if "max_output_tokens" in signature.parameters:
+        result_kwargs["max_output_tokens"] = int(max_tokens)
 
     # 2. Configurar RepetitionPenaltyConfig para evitar bucles de repetición
     if "repetition_penalty_config" in signature.parameters:
