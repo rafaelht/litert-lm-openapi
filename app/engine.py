@@ -87,22 +87,23 @@ def _build_engine_kwargs(model_path: Path) -> dict[str, object]:
     if is_gpu and "use_ringbuffers_local_attention" in engine_signature.parameters:
         engine_kwargs["use_ringbuffers_local_attention"] = settings.use_ringbuffers_local_attention
 
-    # 5. Caché en disco de XNNPACK (Siempre asegurar directorio con permisos de escritura)
-    cache_dir = os.getenv("CACHE_DIR")
-    if not cache_dir:
-        model_dir = (
-            model_path.parent
-            if model_path.is_file() or not model_path.is_dir()
-            else model_path
-        )
-        if os.access(model_dir, os.W_OK):
-            cache_dir = str(model_dir)
-        else:
-            cache_dir = "/tmp/litert_cache"
-            os.makedirs(cache_dir, exist_ok=True)
+    # 5. Caché en disco de XNNPACK (Solo si está explícitamente habilitado en config)
+    if settings.enable_xnnpack_cache:
+        cache_dir = os.getenv("CACHE_DIR")
+        if not cache_dir:
+            model_dir = (
+                model_path.parent
+                if model_path.is_file() or not model_path.is_dir()
+                else model_path
+            )
+            if os.access(model_dir, os.W_OK):
+                cache_dir = str(model_dir)
+            else:
+                cache_dir = "/tmp/litert_cache"
+                os.makedirs(cache_dir, exist_ok=True)
 
-    if "cache_dir" in engine_signature.parameters and cache_dir:
-        engine_kwargs["cache_dir"] = cache_dir
+        if "cache_dir" in engine_signature.parameters and cache_dir:
+            engine_kwargs["cache_dir"] = cache_dir
 
     # 6. Benchmark de LiteRT
     if "enable_benchmark" in engine_signature.parameters:

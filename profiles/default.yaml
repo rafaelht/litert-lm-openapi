@@ -2,8 +2,3 @@ system_prompt: |
   Eres un asistente conciso y directo. Responde de forma detallada solo si el usuario lo solicita.
 memory: |
   Usuario: Rafael Hilario
-generation:
-  temperature: 0.7
-  top_p: 0.9
-  repetition_penalty: 1.15
-  no_repeat_ngram_size: 4

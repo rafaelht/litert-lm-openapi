@@ -441,24 +441,19 @@ class ConversationManager:
                         enable_thinking=False,
                     )
             if "sampler_config" in create_signature.parameters:
-                from litert_lm.interfaces import SamplerConfig
-
-                temp = 0.7
-                top_p = 0.9
                 try:
                     from app.profile_store import get_profile_store
                     gen_defaults = get_profile_store().profile.generation_params
-                    if "temperature" in gen_defaults:
-                        temp = float(gen_defaults["temperature"])
-                    if "top_p" in gen_defaults:
-                        top_p = float(gen_defaults["top_p"])
+                    if "temperature" in gen_defaults or "top_p" in gen_defaults:
+                        from litert_lm.interfaces import SamplerConfig
+                        temp = float(gen_defaults.get("temperature", 0.7))
+                        top_p = float(gen_defaults.get("top_p", 0.9))
+                        conversation_kwargs["sampler_config"] = SamplerConfig(
+                            temperature=temp,
+                            top_p=top_p,
+                        )
                 except Exception:
                     pass
-
-                conversation_kwargs["sampler_config"] = SamplerConfig(
-                    temperature=temp,
-                    top_p=top_p,
-                )
         except (TypeError, ValueError):
             pass
 

@@ -42,39 +42,38 @@ def build_method_kwargs(method: Any, generation_params: dict[str, Any]) -> dict[
     except (TypeError, ValueError):
         return {}
 
-    # 1. Adaptar max_output_tokens con límite de seguridad por turno
+    # 1. Adaptar max_output_tokens si fue especificado por el cliente o perfil
     max_tokens = params.get("max_tokens") or params.get("max_output_tokens")
-    if not max_tokens or int(max_tokens) <= 0:
-        # Límite por turno para evitar que respuestas fuera de control devoren la memoria RAM
-        max_tokens = 1024
-    if "max_output_tokens" in signature.parameters:
+    if max_tokens and int(max_tokens) > 0 and "max_output_tokens" in signature.parameters:
         result_kwargs["max_output_tokens"] = int(max_tokens)
 
-    # 2. Configurar RepetitionPenaltyConfig para evitar bucles de repetición
+    # 2. Configurar RepetitionPenaltyConfig solo si está explícitamente configurado
     if "repetition_penalty_config" in signature.parameters:
-        try:
-            from litert_lm.interfaces import RepetitionPenaltyConfig
-            rep_val = params.get("repetition_penalty", 1.15)
-            pres_val = params.get("presence_penalty", 0.1)
-            freq_val = params.get("frequency_penalty", 0.1)
-            result_kwargs["repetition_penalty_config"] = RepetitionPenaltyConfig(
-                repetition_penalty=float(rep_val) if rep_val is not None else 1.15,
-                presence_penalty=float(pres_val) if pres_val is not None else 0.1,
-                frequency_penalty=float(freq_val) if freq_val is not None else 0.1,
-            )
-        except Exception as e:
-            logger.warning("No se pudo configurar RepetitionPenaltyConfig: %s", e)
+        rep_val = params.get("repetition_penalty")
+        pres_val = params.get("presence_penalty")
+        freq_val = params.get("frequency_penalty")
+        if rep_val is not None or pres_val is not None or freq_val is not None:
+            try:
+                from litert_lm.interfaces import RepetitionPenaltyConfig
+                result_kwargs["repetition_penalty_config"] = RepetitionPenaltyConfig(
+                    repetition_penalty=float(rep_val) if rep_val is not None else 1.0,
+                    presence_penalty=float(pres_val) if pres_val is not None else 0.0,
+                    frequency_penalty=float(freq_val) if freq_val is not None else 0.0,
+                )
+            except Exception as e:
+                logger.warning("No se pudo configurar RepetitionPenaltyConfig: %s", e)
 
-    # 3. Configurar NoRepeatNgramConfig para evitar repeticiones exactas de n-gramas
+    # 3. Configurar NoRepeatNgramConfig solo si está explícitamente configurado (> 0)
     if "no_repeat_ngram_config" in signature.parameters:
-        try:
-            from litert_lm.interfaces import NoRepeatNgramConfig
-            ngram_size = params.get("no_repeat_ngram_size", 4)
-            result_kwargs["no_repeat_ngram_config"] = NoRepeatNgramConfig(
-                no_repeat_ngram_size=int(ngram_size) if ngram_size is not None else 4
-            )
-        except Exception as e:
-            logger.warning("No se pudo configurar NoRepeatNgramConfig: %s", e)
+        ngram_size = params.get("no_repeat_ngram_size")
+        if ngram_size is not None and int(ngram_size) > 0:
+            try:
+                from litert_lm.interfaces import NoRepeatNgramConfig
+                result_kwargs["no_repeat_ngram_config"] = NoRepeatNgramConfig(
+                    no_repeat_ngram_size=int(ngram_size)
+                )
+            except Exception as e:
+                logger.warning("No se pudo configurar NoRepeatNgramConfig: %s", e)
 
     # 4. Parámetros directos compatibles
     for key, value in params.items():
