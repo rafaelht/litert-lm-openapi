@@ -21,6 +21,8 @@ _ALLOWED_GENERATION_PARAMS = {
     "max_tokens",
     "presence_penalty",
     "frequency_penalty",
+    "repetition_penalty",
+    "no_repeat_ngram_size",
     "stop",
     "n",
 }
@@ -155,16 +157,24 @@ def _parse_profile(raw_data: dict[str, Any], profile_path: Path) -> ModelProfile
     )
 
 
-def _load_profile() -> ProfileStore:
-    settings = get_settings()
-    profile_path = _resolve_profile_path(settings.model_profile)
+def _load_profile(target_path: Path | str | None = None) -> ProfileStore:
+    if target_path is not None:
+        profile_path = Path(target_path).resolve()
+    else:
+        settings = get_settings()
+        profile_path = _resolve_profile_path(settings.model_profile)
 
     if not profile_path.exists():
-        raise FileNotFoundError(
-            "Profile file not found: "
-            f"{profile_path}. "
-            "Set MODEL_PROFILE to an absolute path or ensure profiles/ is copied into the image."
-        )
+        fallback_candidate = (
+            Path(__file__).resolve().parents[1] / "profiles" / "default.yaml"
+        ).resolve()
+        if fallback_candidate.exists():
+            profile_path = fallback_candidate
+        else:
+            raise FileNotFoundError(
+                f"Profile file not found: {profile_path}. "
+                "Ensure profiles/ is present."
+            )
 
     with profile_path.open("r", encoding="utf-8") as profile_file:
         raw_data = yaml.safe_load(profile_file) or {}
@@ -181,19 +191,31 @@ def _load_profile() -> ProfileStore:
     return ProfileStore(profile)
 
 
-async def init_profile_store() -> ProfileStore:
+def load_profile_for_model(model_id: str) -> ProfileStore:
+    """Carga dinámicamente el perfil YAML correspondiente al model_id solicitado."""
+    global _profile_store
+    from app.model_manager import resolve_model_profile_path
+
+    resolved_path = resolve_model_profile_path(model_id)
+    _profile_store = _load_profile(resolved_path)
+    return _profile_store
+
+
+async def init_profile_store(initial_path: Path | str | None = None) -> ProfileStore:
     global _profile_store
 
-    if _profile_store is not None:
+    if _profile_store is not None and initial_path is None:
         return _profile_store
 
     async with _store_lock:
-        if _profile_store is None:
-            _profile_store = _load_profile()
+        if _profile_store is None or initial_path is not None:
+            _profile_store = _load_profile(initial_path)
         return _profile_store
 
 
 def get_profile_store() -> ProfileStore:
+    global _profile_store
     if _profile_store is None:
-        raise RuntimeError("Profile store is not initialized")
+        # Inicialización perezosa con perfil por defecto si aún no se inicializó
+        _profile_store = _load_profile()
     return _profile_store

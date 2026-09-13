@@ -37,16 +37,29 @@ requirements.txt
 
 ## Variables de entorno
 
-- `MODEL_PATH` (default: `/models/gemma-4-E2B-it.litertlm/model.litertlm`)
+- `MODELS_DIR` (default: `/models` en contenedor, `/volume2/docker/litertlm/litert-home/models` en host)
+- `PRELOAD_FIRST_MODEL` (default: `false`, permite arranque instantáneo con 0 MB RAM usados hasta la primera petición)
 - `SERVER_PORT` (default: `8000`)
-- `HOST_PORT` (default: `8001`, puerto publicado en el host)
-- `SESSION_TIMEOUT` en segundos (default: `1800`)
-- `MAX_ACTIVE_CONVERSATIONS` (default: `1000`)
-- `MAX_NUM_IMAGES` (default: `4`, habilita entradas multimodales de imagen)
-- `MODEL_PROFILE` (default: `profiles/default.yaml`)
-- `CONTEXT_ROLLOVER_THRESHOLD_TOKENS` (default: `3200`)
-- `CONTEXT_ROLLOVER_RECENT_MESSAGES` (default: `2`, rango soportado: `1` a `3`)
-- `CONTEXT_ROLLOVER_RECENT_TOKEN_BUDGET` (default: `256`)
+- `HOST_PORT` (default: `8005`, puerto publicado en el host)
+- `SESSION_TIMEOUT` en segundos (default: `600`)
+- `MAX_ACTIVE_CONVERSATIONS` (default: `1`)
+- `MAX_NUM_IMAGES` (default: `0`, deshabilitado para ahorrar ~1GB en visión/audio)
+- `MODEL_PROFILE` (default: `profiles/default.yaml`, perfil fallback si no existe `profiles/<model_id>.yaml`)
+- `CONTEXT_ROLLOVER_THRESHOLD_TOKENS` (default: `2600`)
+- `CONTEXT_ROLLOVER_HEADROOM_TOKENS` (default: `1500`)
+- `CONTEXT_ROLLOVER_RECENT_MESSAGES` (default: `4`)
+- `CONTEXT_ROLLOVER_RECENT_TOKEN_BUDGET` (default: `1024`)
+
+## Descubrimiento Dinámico y Hot-Swapping
+
+- **Descubrimiento en tiempo real (`GET /v1/models`)**:
+  - Escanea dinámicamente `/models` detectando subcarpetas con `model.litertlm` (ej. `/models/gemma-4-E2B-it.litertlm/model.litertlm`) y archivos `.litertlm` directos.
+  - Filtra automáticamente archivos de caché de XNNPACK (`*.xnnpack_cache`) y carpetas ocultas.
+- **Lazy-Loading y Hot-Swapping (`POST /v1/chat/completions`)**:
+  - Si el modelo solicitado difiere del que está en memoria, se adquiere un `asyncio.Lock` de exclusión mutua para evitar condiciones de carrera y OOM bajo el límite estricto de 3 GB de RAM.
+  - Se cierran todas las sesiones activas de C++, se destruye el motor previo y se ejecuta recolección forzada de memoria (`gc.collect()` + `malloc_trim`).
+  - Se carga el nuevo modelo y se aplica su perfil YAML correspondiente (`profiles/<model_id>.yaml` o fallback `profiles/default.yaml`).
+  - Si el modelo solicitado no existe en `/models`, retorna HTTP 404 (Model not found).
 
 ## Rolling Context Automatico
 

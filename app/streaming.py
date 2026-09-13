@@ -31,29 +31,54 @@ def sse_data(payload: dict[str, Any] | str) -> str:
 def build_method_kwargs(method: Any, generation_params: dict[str, Any]) -> dict[str, Any]:
     """Filtra y adapta los parámetros de generación a la firma del método de LiteRT-LM."""
     if not generation_params:
-        return {}
+        params: dict[str, Any] = {}
+    else:
+        params = dict(generation_params)
 
-    params = dict(generation_params)
-    if "max_tokens" in params and "max_output_tokens" not in params:
-        params["max_output_tokens"] = params["max_tokens"]
+    result_kwargs: dict[str, Any] = {}
 
     try:
         signature = inspect.signature(method)
     except (TypeError, ValueError):
         return {}
 
-    accepts_var_kwargs = any(
-        parameter.kind == inspect.Parameter.VAR_KEYWORD
-        for parameter in signature.parameters.values()
-    )
-    if accepts_var_kwargs:
-        return params
+    # 1. Adaptar max_output_tokens
+    max_tokens = params.get("max_tokens") or params.get("max_output_tokens")
+    if max_tokens and "max_output_tokens" in signature.parameters:
+        result_kwargs["max_output_tokens"] = max_tokens
 
-    return {
-        key: value
-        for key, value in params.items()
-        if key in signature.parameters
-    }
+    # 2. Configurar RepetitionPenaltyConfig para evitar bucles de repetición
+    if "repetition_penalty_config" in signature.parameters:
+        try:
+            from litert_lm.interfaces import RepetitionPenaltyConfig
+            rep_val = params.get("repetition_penalty", 1.15)
+            pres_val = params.get("presence_penalty", 0.1)
+            freq_val = params.get("frequency_penalty", 0.1)
+            result_kwargs["repetition_penalty_config"] = RepetitionPenaltyConfig(
+                repetition_penalty=float(rep_val) if rep_val is not None else 1.15,
+                presence_penalty=float(pres_val) if pres_val is not None else 0.1,
+                frequency_penalty=float(freq_val) if freq_val is not None else 0.1,
+            )
+        except Exception as e:
+            logger.warning("No se pudo configurar RepetitionPenaltyConfig: %s", e)
+
+    # 3. Configurar NoRepeatNgramConfig para evitar repeticiones exactas de n-gramas
+    if "no_repeat_ngram_config" in signature.parameters:
+        try:
+            from litert_lm.interfaces import NoRepeatNgramConfig
+            ngram_size = params.get("no_repeat_ngram_size", 4)
+            result_kwargs["no_repeat_ngram_config"] = NoRepeatNgramConfig(
+                no_repeat_ngram_size=int(ngram_size) if ngram_size is not None else 4
+            )
+        except Exception as e:
+            logger.warning("No se pudo configurar NoRepeatNgramConfig: %s", e)
+
+    # 4. Parámetros directos compatibles
+    for key, value in params.items():
+        if key in signature.parameters and key not in result_kwargs:
+            result_kwargs[key] = value
+
+    return result_kwargs
 
 
 async def create_chat_event_stream(

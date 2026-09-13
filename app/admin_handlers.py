@@ -197,7 +197,7 @@ async def handle_admin_completion(
             chat_title = "Conversación General"
             title_conv = None
             try:
-                engine = await init_engine()
+                engine = await init_engine(request.model)
                 title_conv = engine.create_conversation(
                     system_message='Resume en un título de 3 a 5 palabras en formato JSON: {"title": "..."}.',
                     max_output_tokens=25,
@@ -228,7 +228,7 @@ async def handle_admin_completion(
         if settings.enable_admin_llm:
             tags_conv = None
             try:
-                engine = await init_engine()
+                engine = await init_engine(request.model)
                 tags_conv = engine.create_conversation(
                     system_message='Genera 1 a 3 etiquetas breves en lista JSON: ["tag1", "tag2"].',
                     max_output_tokens=20,

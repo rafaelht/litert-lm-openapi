@@ -33,7 +33,7 @@ class ConversationState:
 
 
 class ConversationManager:
-    def __init__(self, engine: Engine) -> None:
+    def __init__(self, engine: Engine | None = None) -> None:
         self._engine = engine
         self._settings = get_settings()
         self._conversations: dict[str, ConversationState] = {}
@@ -43,6 +43,16 @@ class ConversationManager:
         self._rollover_recent_messages = min(10, max(1, configured_recent))
         self._rollover_recent_token_budget = max(512, self._settings.context_rollover_recent_token_budget)
         self._rollover_summary_token_budget = 256
+
+    def set_engine(self, engine: Engine) -> None:
+        """Asigna un nuevo motor C++ LiteRT y limpia el mapa de conversaciones previas."""
+        self._engine = engine
+        self._conversations.clear()
+
+    def clear(self) -> None:
+        """Limpia las conversaciones activas."""
+        self._conversations.clear()
+
 
     async def get_or_create(
         self,
@@ -412,12 +422,36 @@ class ConversationManager:
                 conversation_kwargs["system_message"] = bootstrap_system_message
             if "filter_channel_content_from_kv_cache" in create_signature.parameters:
                 conversation_kwargs["filter_channel_content_from_kv_cache"] = True
-            if thinking_enabled and "thinking_config" in create_signature.parameters:
+            if "thinking_config" in create_signature.parameters:
                 from litert_lm.interfaces import ThinkingConfig
 
-                conversation_kwargs["thinking_config"] = ThinkingConfig(
-                    enable_thinking=True,
-                    thinking_token_budget=self._settings.thinking_token_budget,
+                if thinking_enabled:
+                    conversation_kwargs["thinking_config"] = ThinkingConfig(
+                        enable_thinking=True,
+                        thinking_token_budget=self._settings.thinking_token_budget,
+                    )
+                else:
+                    conversation_kwargs["thinking_config"] = ThinkingConfig(
+                        enable_thinking=False,
+                    )
+            if "sampler_config" in create_signature.parameters:
+                from litert_lm.interfaces import SamplerConfig
+
+                temp = 0.7
+                top_p = 0.9
+                try:
+                    from app.profile_store import get_profile_store
+                    gen_defaults = get_profile_store().profile.generation_params
+                    if "temperature" in gen_defaults:
+                        temp = float(gen_defaults["temperature"])
+                    if "top_p" in gen_defaults:
+                        top_p = float(gen_defaults["top_p"])
+                except Exception:
+                    pass
+
+                conversation_kwargs["sampler_config"] = SamplerConfig(
+                    temperature=temp,
+                    top_p=top_p,
                 )
         except (TypeError, ValueError):
             pass
@@ -697,21 +731,26 @@ _conversation_manager: ConversationManager | None = None
 _manager_lock = asyncio.Lock()
 
 
-async def init_conversation_manager(engine: Engine) -> ConversationManager:
+async def init_conversation_manager(engine: Engine | None = None) -> ConversationManager:
     global _conversation_manager
 
     if _conversation_manager is not None:
+        if engine is not None:
+            _conversation_manager.set_engine(engine)
         return _conversation_manager
 
     async with _manager_lock:
         if _conversation_manager is None:
             _conversation_manager = ConversationManager(engine)
+        elif engine is not None:
+            _conversation_manager.set_engine(engine)
         return _conversation_manager
 
 
 def get_conversation_manager() -> ConversationManager:
+    global _conversation_manager
     if _conversation_manager is None:
-        raise RuntimeError("Conversation manager is not initialized")
+        _conversation_manager = ConversationManager(None)
     return _conversation_manager
 
 
@@ -723,3 +762,4 @@ async def close_conversation_manager() -> None:
             return
         await _conversation_manager.close_all()
         _conversation_manager = None
+

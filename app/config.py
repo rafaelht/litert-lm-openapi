@@ -8,7 +8,9 @@ from pathlib import Path
 
 @dataclass(frozen=True)
 class Settings:
+    models_dir: str
     model_path: str
+    preload_first_model: bool
     model_profile: str
     server_port: int
     session_timeout: int
@@ -32,16 +34,19 @@ class Settings:
 
     @property
     def model_id(self) -> str:
-        return Path(self.model_path).parent.name or "litert-model"
+        if self.model_path:
+            p = Path(self.model_path)
+            return p.parent.name if p.name == "model.litertlm" else p.name
+        return "litert-model"
 
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
     return Settings(
-        model_path=os.getenv(
-            "MODEL_PATH",
-            "/models/gemma-4-E2B-it.litertlm/model.litertlm",
-        ),
+        models_dir=os.getenv("MODELS_DIR", "/models"),
+        model_path=os.getenv("MODEL_PATH", ""),
+        preload_first_model=os.getenv("PRELOAD_FIRST_MODEL", "false").lower()
+        in {"true", "1", "yes"},
         model_profile=os.getenv("MODEL_PROFILE", "profiles/default.yaml"),
         server_port=int(os.getenv("SERVER_PORT", "8000")),
         session_timeout=int(os.getenv("SESSION_TIMEOUT", "600")),

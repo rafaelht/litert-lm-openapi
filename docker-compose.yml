@@ -4,7 +4,8 @@ services:
     container_name: litert-lm-openapi
     restart: unless-stopped
     environment:
-      MODEL_PATH: ${MODEL_PATH:-/models/gemma-4-E2B-it.litertlm/model.litertlm}
+      MODELS_DIR: ${MODELS_DIR_INTERNAL:-/models}
+      PRELOAD_FIRST_MODEL: ${PRELOAD_FIRST_MODEL:-false}
       SERVER_PORT: ${SERVER_PORT:-8000}
       SESSION_TIMEOUT: ${SESSION_TIMEOUT:-600}
       MAX_ACTIVE_CONVERSATIONS: ${MAX_ACTIVE_CONVERSATIONS:-1}

@@ -3,11 +3,11 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-MODEL_PATH_VALUE="${MODEL_PATH:-models/gemma-4-E2B-it.litertlm}"
+MODELS_DIR_VALUE="${MODELS_DIR:-models}"
 SERVER_PORT_VALUE="${SERVER_PORT:-8005}"
 
-if [[ ! -f "$MODEL_PATH_VALUE" ]]; then
-  echo "Model file not found: $MODEL_PATH_VALUE"
+if [[ ! -d "$MODELS_DIR_VALUE" ]]; then
+  echo "Models directory not found: $MODELS_DIR_VALUE"
   exit 1
 fi
 
@@ -30,6 +30,6 @@ echo "LAN:     http://<YOUR_MAC_IP>:${SERVER_PORT_VALUE}/v1"
 echo "Health:  http://127.0.0.1:${SERVER_PORT_VALUE}/healthz"
 echo
 
-MODEL_PATH="$MODEL_PATH_VALUE" \
+MODELS_DIR="$MODELS_DIR_VALUE" \
 SERVER_PORT="$SERVER_PORT_VALUE" \
 .venv/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port "$SERVER_PORT_VALUE"

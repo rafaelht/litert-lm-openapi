@@ -174,12 +174,13 @@ class TestServerOptimizations(unittest.TestCase):
             models_data = res_models.json()
             self.assertEqual(models_data["object"], "list")
             self.assertTrue(len(models_data["data"]) > 0)
+            valid_model_id = models_data["data"][0]["id"]
 
             # 3. Intercepción administrativa de Título (OpenWebUI)
             res_title = client.post(
                 "/v1/chat/completions",
                 json={
-                    "model": "gemma-test",
+                    "model": valid_model_id,
                     "messages": [{"role": "user", "content": "Create a creative title with an emoji"}],
                     "max_tokens": 20,
                     "stream": False,
@@ -193,7 +194,7 @@ class TestServerOptimizations(unittest.TestCase):
             res_title_stream = client.post(
                 "/v1/chat/completions",
                 json={
-                    "model": "gemma-test",
+                    "model": valid_model_id,
                     "messages": [{"role": "user", "content": "Create a creative title with an emoji"}],
                     "max_tokens": 20,
                     "stream": True,
@@ -202,6 +203,16 @@ class TestServerOptimizations(unittest.TestCase):
             self.assertEqual(res_title_stream.status_code, 200)
             self.assertIn("data: ", res_title_stream.text)
             self.assertIn("[DONE]", res_title_stream.text)
+
+            # 5. Modelo inexistente retorna 404 (Model not found)
+            res_not_found = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "non-existent-model.litertlm",
+                    "messages": [{"role": "user", "content": "Hola"}],
+                },
+            )
+            self.assertEqual(res_not_found.status_code, 404)
 
     def test_context_rollover_and_summary(self):
         import asyncio
@@ -333,6 +344,123 @@ class TestServerOptimizations(unittest.TestCase):
             self.assertTrue(_is_thinking_requested(req_thinking_true))
             self.assertTrue(_is_thinking_requested(req_high))
 
+    def test_dynamic_model_discovery(self):
+        import tempfile
+        from pathlib import Path
+        from app.model_manager import discover_models, resolve_model
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+
+            # 1. Subcarpeta con model.litertlm
+            subfolder = tmp_path / "gemma-4-E2B-it.litertlm"
+            subfolder.mkdir()
+            (subfolder / "model.litertlm").write_text("dummy model data")
+
+            # 2. Archivo directo .litertlm
+            (tmp_path / "MiniCPM5-2B.litertlm").write_text("dummy model data")
+
+            # 3. Archivos que deben ser ignorados (cache, temporales, extensiones ajenas)
+            (tmp_path / "gemma-4-E2B-it.litertlm_123.vision.xnnpack_cache").write_text("cache")
+            (tmp_path / ".hidden_model.litertlm").write_text("hidden")
+            (tmp_path / "notes.txt").write_text("notes")
+
+            # Ejecutar descubrimiento
+            models = discover_models(tmp_path)
+
+            self.assertEqual(len(models), 2)
+            self.assertIn("gemma-4-E2B-it.litertlm", models)
+            self.assertIn("MiniCPM5-2B.litertlm", models)
+            self.assertEqual(models["gemma-4-E2B-it.litertlm"].path, (subfolder / "model.litertlm").resolve())
+            self.assertEqual(models["MiniCPM5-2B.litertlm"].path, (tmp_path / "MiniCPM5-2B.litertlm").resolve())
+
+            # Probar resolución flexible
+            # A) Coincidencia exacta
+            res1 = resolve_model("MiniCPM5-2B.litertlm", tmp_path)
+            self.assertIsNotNone(res1)
+            self.assertEqual(res1.id, "MiniCPM5-2B.litertlm")
+
+            # B) Sin extensión
+            res2 = resolve_model("MiniCPM5-2B", tmp_path)
+            self.assertIsNotNone(res2)
+            self.assertEqual(res2.id, "MiniCPM5-2B.litertlm")
+
+            # C) Modelo inexistente
+            res3 = resolve_model("unknown-model", tmp_path)
+            self.assertIsNone(res3)
+
+    def test_model_profile_resolution(self):
+        import tempfile
+        from pathlib import Path
+        from app.model_manager import resolve_model_profile_path
+
+        # Probar fallback a default.yaml
+        resolved_default = resolve_model_profile_path("any-random-model-without-profile")
+        self.assertTrue(resolved_default.name == "default.yaml")
+        self.assertTrue(resolved_default.exists())
+
+    def test_engine_hot_swapping_memory_cleanup(self):
+        import asyncio
+        from unittest.mock import AsyncMock, patch, MagicMock
+        from app import engine as engine_module
+
+        loop = asyncio.new_event_loop()
+        try:
+            # Simular motor existente
+            mock_old_engine = MagicMock()
+            mock_old_engine.close = MagicMock()
+
+            mock_new_engine = MagicMock()
+            mock_new_engine.close = MagicMock()
+
+            # Configurar estado inicial
+            engine_module._engine = mock_old_engine
+            engine_module._current_model_id = "model-A"
+
+            # Mockear Engine(...) constructor y conversación
+            with patch("app.engine.Engine", return_value=mock_new_engine) as mock_engine_cls, \
+                 patch("app.engine.force_garbage_collection") as mock_gc, \
+                 patch("app.model_manager.resolve_model") as mock_resolve:
+
+                from app.model_manager import DiscoveredModel
+                from pathlib import Path
+
+                mock_resolve.return_value = DiscoveredModel(
+                    id="model-B",
+                    path=Path("/tmp/model-B.litertlm"),
+                    created=100,
+                    size_bytes=1000,
+                )
+
+                # Ejecutar swap a model-B
+                new_eng, active_id = loop.run_until_complete(
+                    engine_module.get_or_load_engine("model-B")
+                )
+
+                # Verificar que el motor antiguo fue cerrado
+                self.assertTrue(mock_old_engine.close.called)
+                # Verificar que se forzó la recolección de basura
+                self.assertTrue(mock_gc.called)
+                # Verificar que el nuevo motor está activo
+                self.assertEqual(active_id, "model-B")
+                self.assertEqual(new_eng, mock_new_engine)
+                self.assertEqual(engine_module.get_current_model_id(), "model-B")
+
+                # Llamar de nuevo con model-B no debe recrear el motor (reutilización en RAM)
+                mock_engine_cls.reset_mock()
+                new_eng2, active_id2 = loop.run_until_complete(
+                    engine_module.get_or_load_engine("model-B")
+                )
+                self.assertEqual(active_id2, "model-B")
+                self.assertFalse(mock_engine_cls.called)
+
+        finally:
+            # Restaurar estado
+            engine_module._engine = None
+            engine_module._current_model_id = None
+            loop.close()
+
 
 if __name__ == "__main__":
     unittest.main()
+

@@ -15,10 +15,13 @@ from app.conversation_manager import get_conversation_manager
 from app.engine import (
     check_and_consume_reload_flag,
     force_garbage_collection,
+    get_current_model_id,
+    get_or_load_engine,
     init_engine,
     update_engine_activity,
 )
 from app.metrics import compute_usage_and_metrics
+from app.model_manager import discover_models, resolve_model
 from app.profile_store import get_profile_store
 from app.schemas import (
     ChatCompletionChoice,
@@ -92,15 +95,27 @@ def _is_thinking_requested(request: ChatCompletionRequest) -> bool:
 
 @router.get("/models", response_model=OpenAIModelListResponse)
 async def list_models() -> OpenAIModelListResponse:
-    settings = get_settings()
-    return OpenAIModelListResponse(
-        data=[
-            OpenAIModel(
-                id=settings.model_id,
-                created=int(time.time()),
+    discovered = discover_models()
+    models_data: list[OpenAIModel] = [
+        OpenAIModel(
+            id=model_info.id,
+            created=model_info.created,
+            owned_by="litert-session-server",
+        )
+        for model_info in discovered.values()
+    ]
+    if not models_data:
+        current_id = get_current_model_id()
+        if current_id:
+            models_data.append(
+                OpenAIModel(
+                    id=current_id,
+                    created=int(time.time()),
+                    owned_by="litert-session-server",
+                )
             )
-        ]
-    )
+
+    return OpenAIModelListResponse(data=models_data)
 
 
 @router.post("/chat/completions", response_model=None)
@@ -110,7 +125,16 @@ async def chat_completions(
     authorization: str | None = Header(default=None),
 ) -> Response:
     settings = get_settings()
-    profile_store = get_profile_store()
+
+    # 0. Validar existencia y resolver el modelo solicitado antes de procesar
+    resolved = resolve_model(request.model)
+    if resolved is None:
+        available_ids = list(discover_models().keys())
+        raise HTTPException(
+            status_code=404,
+            detail=f"Model '{request.model}' not found in models directory. Available models: {available_ids}",
+        )
+    request.model = resolved.id
 
     message_dicts = [
         message.model_dump(by_alias=True, exclude_none=True)
@@ -144,8 +168,9 @@ async def chat_completions(
             completion_id=completion_id,
         )
 
-    # 2. Flujo normal de conversación
-    engine_instance = await init_engine()
+    # 2. Flujo normal de conversación: Carga o reutiliza el modelo bajo demanda (Lazy / Hot-Swap)
+    engine_instance, active_model_id = await get_or_load_engine(resolved.id)
+    profile_store = get_profile_store()
 
     api_key = extract_api_key(authorization)
     conversation_id = make_conversation_id(api_key, request.model, message_dicts)
