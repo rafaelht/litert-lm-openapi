@@ -10,6 +10,7 @@ from typing import Any
 from litert_lm import Conversation, Engine, Tool
 
 from app.config import get_settings
+from app.engine import force_garbage_collection
 from app.utils import normalize_text_content, now_ts, sdk_message_to_text
 
 logger = logging.getLogger(__name__)
@@ -106,7 +107,7 @@ class ConversationManager:
             )
 
             warm_conv = None
-            if bootstrap_system_message:
+            if self._settings.enable_warm_pool and bootstrap_system_message:
                 pool_key = hashlib.sha256(bootstrap_system_message.encode()).hexdigest()[:16]
                 warm_conv = self._warm_pool.pop(pool_key, None)
 
@@ -121,32 +122,14 @@ class ConversationManager:
                 sampler_config=sampler_config,
             )
 
-            if warm_conv is not None:
-                logger.info("Using pre-warmed conversation for %s (TTFT saved)", conversation_id)
-                conversation = warm_conv
-                if prepared_bootstrap_messages:
-                    for msg in prepared_bootstrap_messages:
-                        try:
-                            # send_message processes the tokens for the history message
-                            # Wait, the SDK needs to know if this is a user or assistant msg.
-                            # send_message normally expects the payload for generation.
-                            # Actually, if we use a pre-warmed conversation, we can't easily inject a list of messages.
-                            # So the warm pool is ONLY useful if bootstrap_messages is empty.
-                            # Otherwise, we fallback to create_conversation.
-                            pass
-                        except Exception:
-                            pass
-                    # Let's fix this in the logic.
-            
-            # Re-evaluate warm_conv logic: we can only use it if prepared_bootstrap_messages is empty
+            # Re-evaluate warm_conv logic: solo se usa si no hay mensajes previos ni tools
             if warm_conv is not None and not prepared_bootstrap_messages and not tools:
                 logger.info("Using pre-warmed conversation for %s (TTFT saved)", conversation_id)
                 conversation = warm_conv
-                # Start warming the next one in background
-                asyncio.create_task(self.warm_system_prompt(bootstrap_system_message))
+                if self._settings.enable_warm_pool:
+                    asyncio.create_task(self.warm_system_prompt(bootstrap_system_message))
             else:
-                if warm_conv is not None:
-                    # Put it back since we couldn't use it
+                if warm_conv is not None and self._settings.enable_warm_pool:
                     pool_key = hashlib.sha256(bootstrap_system_message.encode()).hexdigest()[:16]
                     self._warm_pool[pool_key] = warm_conv
                     
@@ -444,6 +427,13 @@ class ConversationManager:
         compact_summary = self._compact_summary_text(merged_summary)
         rollover_messages = self._build_rollover_messages(compact_summary, recent_messages)
 
+        old_conversation = state.conversation
+        if hasattr(old_conversation, "close"):
+            try:
+                await asyncio.to_thread(old_conversation.close)
+            except Exception:
+                logger.exception("Error closing old conversation during rollover for %s", state.conversation_id)
+
         new_conversation = await self._create_conversation(
             bootstrap_messages=rollover_messages,
             bootstrap_system_message=state.bootstrap_system_message,
@@ -471,17 +461,10 @@ class ConversationManager:
             )
             state.tools = effective_tools
 
-        old_conversation = state.conversation
         state.conversation = new_conversation
         state.summary_text = compact_summary
         state.rolling_messages = list(recent_messages)
         state.rollover_count += 1
-
-        if hasattr(old_conversation, "close"):
-            try:
-                await asyncio.to_thread(old_conversation.close)
-            except Exception:
-                logger.exception("Error closing old conversation during rollover for %s", state.conversation_id)
 
         post_tokens = self._estimate_context_tokens(
             state.bootstrap_system_message,
@@ -996,6 +979,7 @@ class ConversationManager:
 
         if expired_ids:
             logger.info("Cleaned up %s expired conversations", len(expired_ids))
+            force_garbage_collection()
         return len(expired_ids)
 
     async def _delete_locked(self, conversation_id: str) -> None:
@@ -1011,8 +995,8 @@ class ConversationManager:
                 logger.exception("Error closing conversation backend thread for %s", conversation_id)
 
     async def warm_system_prompt(self, system_message: str) -> None:
-        """Pre-calienta una conversación con el system prompt dado."""
-        if not system_message:
+        """Pre-calienta una conversación con el system prompt dado si está habilitado."""
+        if not self._settings.enable_warm_pool or not system_message:
             return
         
         pool_key = hashlib.sha256(system_message.encode()).hexdigest()[:16]

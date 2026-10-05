@@ -12,7 +12,17 @@ from fastapi import APIRouter, Header, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 from anyio import to_thread
 
-from litert_lm import RepetitionPenaltyConfig, SamplerConfig, ThinkingConfig
+from litert_lm import SamplerConfig
+
+try:
+    from litert_lm import ThinkingConfig
+except ImportError:
+    ThinkingConfig = None  # type: ignore[assignment, misc]
+
+try:
+    from litert_lm import RepetitionPenaltyConfig
+except ImportError:
+    RepetitionPenaltyConfig = None  # type: ignore[assignment, misc]
 
 from app.config import get_settings
 from app.conversation_manager import get_conversation_manager
@@ -39,6 +49,17 @@ from app.utils import (
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/v1", tags=["openai-compatible"])
+
+_generation_semaphore: asyncio.Semaphore | None = None
+
+
+def _get_generation_semaphore() -> asyncio.Semaphore:
+    global _generation_semaphore
+    if _generation_semaphore is None:
+        settings = get_settings()
+        limit = max(1, settings.max_concurrent_generations)
+        _generation_semaphore = asyncio.Semaphore(limit)
+    return _generation_semaphore
 
 
 def _build_method_kwargs(method: Any, generation_params: dict[str, Any]) -> dict[str, Any]:
@@ -464,25 +485,27 @@ async def chat_completions(
     if request.stream:
 
         async def event_stream() -> AsyncIterator[str]:
-            async with state.lock:
-                state.touch()
-                update_engine_activity()
-                await manager.prepare_for_turn(state, incremental_payload)
+            semaphore = _get_generation_semaphore()
+            async with semaphore:
+                async with state.lock:
+                    state.touch()
+                    update_engine_activity()
+                    await manager.prepare_for_turn(state, incremental_payload)
 
-                first_chunk = {
-                    "id": completion_id,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": request.model,
-                    "choices": [
-                        {
-                            "index": 0,
-                            "delta": {"role": "assistant"},
-                            "finish_reason": None,
-                        }
-                    ],
-                }
-                yield _sse_data(first_chunk)
+                    first_chunk = {
+                        "id": completion_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": request.model,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"role": "assistant"},
+                                "finish_reason": None,
+                            }
+                        ],
+                    }
+                    yield _sse_data(first_chunk)
 
                 streamed_text_parts: list[str] = []
                 streamed_tool_calls: list[dict[str, Any]] = []
@@ -683,9 +706,11 @@ async def chat_completions(
         )
 
     # Bloque síncrono estándar (No-Stream)
-    async with state.lock:
-        state.touch()
-        update_engine_activity()
+    semaphore = _get_generation_semaphore()
+    async with semaphore:
+        async with state.lock:
+            state.touch()
+            update_engine_activity()
         for attempt in range(2):
             try:
                 await manager.prepare_for_turn(state, incremental_payload)

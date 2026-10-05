@@ -16,12 +16,8 @@ logger = logging.getLogger(__name__)
 _engine: Optional[Engine] = None
 _engine_lock = asyncio.Lock()
 _engine_just_reloaded: bool = False
-
-# Variables para control de TTL
 _last_active_time: float = 0.0
 _cleanup_task: Optional[asyncio.Task] = None
-TTL_SECONDS: int = 3600  # 1 hora en reposo antes de descargar
-
 
 def force_garbage_collection() -> None:
     """Fuerza a la biblioteca C (glibc) a liberar y devolver las arenas
@@ -42,25 +38,37 @@ def update_engine_activity() -> None:
     _last_active_time = time.time()
 
 
+def get_engine_ttl() -> int:
+    try:
+        return get_settings().engine_ttl_seconds
+    except Exception:
+        return 0
+
+
 async def _monitor_inactivity() -> None:
-    """Loop en segundo plano que descarga el modelo si expira el TTL."""
+    """Loop en segundo plano que descarga el modelo si expira el TTL (si TTL > 0)."""
     global _engine
+    ttl_seconds = get_engine_ttl()
+    if ttl_seconds <= 0:
+        logger.info("Engine TTL desactivado (modelo residente en memoria).")
+        return
+
     while _engine is not None:
-        await asyncio.sleep(15)  # Verificación más frecuente para precisión
-        
+        await asyncio.sleep(15)  # Verificación periódica
+
         async with _engine_lock:
             if _engine is None:
                 break
-            
+
             elapsed = time.time() - _last_active_time
-            if elapsed >= TTL_SECONDS:
-                logger.info("TTL de inactividad alcanzado (%ds). Descargando LiteRT de la RAM...", TTL_SECONDS)
-                
+            if elapsed >= ttl_seconds:
+                logger.info("TTL de inactividad alcanzado (%ds). Descargando LiteRT de la RAM...", ttl_seconds)
+
                 engine = _engine
                 _engine = None
                 await asyncio.to_thread(engine.close)
                 logger.info("LiteRT engine liberado automáticamente por inactividad.")
-                
+
                 force_garbage_collection()
                 break
 

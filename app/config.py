@@ -41,7 +41,9 @@ class Settings:
     model_profile: str
     server_port: int
     session_timeout: int
+    engine_ttl_seconds: int
     max_active_conversations: int
+    max_concurrent_generations: int
     max_num_images: int
     context_rollover_threshold_tokens: int
     context_rollover_recent_messages: int
@@ -49,6 +51,7 @@ class Settings:
     enable_thinking: bool
     enable_tool_calling: bool
     filter_thinking_from_kv_cache: bool
+    enable_warm_pool: bool
 
     @property
     def model_id(self) -> str:
@@ -66,18 +69,21 @@ def get_settings() -> Settings:
         model_profile=os.getenv("MODEL_PROFILE", "profiles/default.yaml"),
         server_port=int(os.getenv("SERVER_PORT", "8000")),
         session_timeout=int(os.getenv("SESSION_TIMEOUT", "1800")),
-        max_active_conversations=int(os.getenv("MAX_ACTIVE_CONVERSATIONS", "1000")),
+        engine_ttl_seconds=int(os.getenv("ENGINE_TTL_SECONDS", os.getenv("ENGINE_TTL", "0"))),
+        max_active_conversations=int(os.getenv("MAX_ACTIVE_CONVERSATIONS", "20")),
+        max_concurrent_generations=int(os.getenv("MAX_CONCURRENT_GENERATIONS", "1")),
         max_num_images=int(os.getenv("MAX_NUM_IMAGES", "4")),
         context_rollover_threshold_tokens=int(
-            os.getenv("CONTEXT_ROLLOVER_THRESHOLD_TOKENS", "3200")
+            os.getenv("CONTEXT_ROLLOVER_THRESHOLD_TOKENS", "4096")
         ),
         context_rollover_recent_messages=int(
             os.getenv("CONTEXT_ROLLOVER_RECENT_MESSAGES", "2")
         ),
         context_rollover_recent_token_budget=int(
-            os.getenv("CONTEXT_ROLLOVER_RECENT_TOKEN_BUDGET", "256")
+            os.getenv("CONTEXT_ROLLOVER_RECENT_TOKEN_BUDGET", "512")
         ),
         enable_thinking=_env_bool("ENABLE_THINKING"),
-        enable_tool_calling=_env_bool("ENABLE_TOOL_CALLING", "true"),
+        enable_tool_calling=_env_bool("ENABLE_TOOL_CALLING", os.getenv("ENABLE_TOOLS", "true")),
         filter_thinking_from_kv_cache=_env_bool("FILTER_THINKING_FROM_KV_CACHE", "true"),
+        enable_warm_pool=_env_bool("ENABLE_WARM_POOL", "false"),
     )
