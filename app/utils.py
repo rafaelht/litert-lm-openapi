@@ -129,51 +129,97 @@ def _translate_content_part(part: dict[str, Any]) -> dict[str, Any] | Any:
     return part
 
 
-def _tool_call_names_by_id(messages: list[dict[str, Any]]) -> dict[str, str]:
-    names: dict[str, str] = {}
-    for message in messages:
-        tool_calls = message.get("tool_calls")
-        if not isinstance(tool_calls, list):
+def format_tools_system_prompt(tools: list[dict[str, Any]] | None) -> str:
+    """Genera la sección del system prompt con las herramientas disponibles de forma compacta y eficiente."""
+    if not tools:
+        return ""
+
+    tool_descs: list[str] = []
+    for tool in tools:
+        fn = tool.get("function") if tool.get("type") == "function" or "function" in tool else tool
+        if not fn or not isinstance(fn, dict):
             continue
-        for tool_call in tool_calls:
-            if not isinstance(tool_call, dict):
-                continue
-            tool_call_id = tool_call.get("id")
-            function = tool_call.get("function")
-            if (
-                isinstance(tool_call_id, str)
-                and isinstance(function, dict)
-                and isinstance(function.get("name"), str)
-            ):
-                names[tool_call_id] = function["name"]
-    return names
+        name = fn.get("name", "")
+        if not name:
+            continue
+        desc = fn.get("description", "").strip()
+        if desc:
+            desc = desc.split("\n")[0].strip()
+
+        params = fn.get("parameters", {})
+        param_names: list[str] = []
+        if isinstance(params, dict):
+            props = params.get("properties", {})
+            if isinstance(props, dict):
+                for p_name, p_info in props.items():
+                    p_type = p_info.get("type", "") if isinstance(p_info, dict) else ""
+                    param_names.append(f"{p_name}: {p_type}" if p_type else p_name)
+
+        sig = f"{name}({', '.join(param_names)})"
+        tool_descs.append(f"- `{sig}`: {desc}" if desc else f"- `{sig}`")
+
+    tools_block = "\n".join(tool_descs)
+    return (
+        "# Available Tools:\n"
+        f"{tools_block}\n\n"
+        "To call a tool, respond with a JSON tool call wrapped in <tool_call>...</tool_call>:\n"
+        "<tool_call>\n"
+        '{"name": "tool_name", "arguments": {"param_key": "param_val"}}\n'
+        "</tool_call>\n"
+        "Call the tool first when asked for status, monitoring, containers or real-time data."
+    )
 
 
-def translate_openai_message(
-    message: dict[str, Any],
-    *,
-    tool_response_name: str | None = None,
-) -> dict[str, Any]:
+def extract_tool_calls_from_text(text: str) -> list[dict[str, Any]] | None:
+    """Extrae llamadas a herramientas en formato <tool_call> o JSON."""
+    if not text:
+        return None
+
+    import re
+    import uuid
+
+    matches = re.findall(r"<tool_call>\s*({.*?})\s*</tool_call>", text, re.DOTALL)
+    if not matches:
+        matches = re.findall(r"```(?:json)?\s*({[^{}]*?\"name\"\s*:[^{}]*?})\s*```", text, re.DOTALL)
+
+    tool_calls: list[dict[str, Any]] = []
+    for i, raw_json in enumerate(matches):
+        try:
+            data = json.loads(raw_json)
+            if isinstance(data, dict) and "name" in data:
+                fn_name = data.get("name")
+                fn_args = data.get("arguments", {})
+                if not isinstance(fn_args, str):
+                    fn_args = json.dumps(fn_args, ensure_ascii=False)
+                tool_calls.append({
+                    "index": i,
+                    "id": f"call_{uuid.uuid4().hex[:8]}",
+                    "type": "function",
+                    "function": {
+                        "name": fn_name,
+                        "arguments": fn_args,
+                    },
+                })
+        except Exception:
+            continue
+
+    return tool_calls if tool_calls else None
+
+
+def translate_openai_message(message: dict[str, Any]) -> dict[str, Any]:
     role = message.get("role", "user")
     content = message.get("content")
-    translated: dict[str, Any] = {"role": role}
+    name = message.get("name") or message.get("tool_call_id") or "tool"
 
-    if role == "tool":
-        tool_name = tool_response_name or message.get("name") or message.get("tool_call_id") or "tool"
-        translated["content"] = [
-            {
-                "type": "tool_response",
-                "name": str(tool_name),
-                "response": content,
-            }
-        ]
-        return translated
+    if role in {"tool", "function"}:
+        text_content = normalize_text_content(content)
+        return {
+            "role": "user",
+            "content": f"[Tool Result for {name}]:\n{text_content}",
+        }
 
     if not isinstance(content, list):
-        translated["content"] = content
-        if "tool_calls" in message:
-            translated["tool_calls"] = message["tool_calls"]
-        return translated
+        return {"role": role, "content": content}
 
     translated_content: list[Any] = []
     for part in content:
@@ -182,10 +228,10 @@ def translate_openai_message(
         else:
             translated_content.append(part)
 
-    translated["content"] = translated_content
-    if "tool_calls" in message:
-        translated["tool_calls"] = message["tool_calls"]
-    return translated
+    return {
+        "role": role,
+        "content": translated_content,
+    }
 
 
 def extract_system_prompt(messages: list[dict[str, Any]]) -> str:
@@ -198,7 +244,7 @@ def extract_system_prompt(messages: list[dict[str, Any]]) -> str:
 
 def extract_first_user_message(messages: list[dict[str, Any]]) -> str:
     for message in messages:
-        if message.get("role") == "user":
+        if message.get("role") in {"user", "tool", "function"}:
             return normalize_text_content(message.get("content")).strip()
     return ""
 
@@ -206,7 +252,9 @@ def extract_first_user_message(messages: list[dict[str, Any]]) -> str:
 def extract_incremental_message(messages: list[dict[str, Any]]) -> str:
     if not messages:
         raise ValueError("messages must not be empty")
-    return normalize_text_content(messages[-1].get("content", ""))
+    last_msg = messages[-1]
+    trans = translate_openai_message(last_msg)
+    return normalize_text_content(trans.get("content", ""))
 
 
 def extract_incremental_message_payload(messages: list[dict[str, Any]]) -> str | dict[str, Any]:
@@ -214,16 +262,7 @@ def extract_incremental_message_payload(messages: list[dict[str, Any]]) -> str |
         raise ValueError("messages must not be empty")
 
     last_message = messages[-1]
-    tool_response_name = None
-    if last_message.get("role") == "tool":
-        tool_call_id = last_message.get("tool_call_id")
-        if isinstance(tool_call_id, str):
-            tool_response_name = _tool_call_names_by_id(messages[:-1]).get(tool_call_id)
-
-    translated = translate_openai_message(
-        last_message,
-        tool_response_name=tool_response_name,
-    )
+    translated = translate_openai_message(last_message)
     content = translated.get("content")
 
     if isinstance(content, list):
@@ -238,74 +277,127 @@ def extract_incremental_message_payload(messages: list[dict[str, Any]]) -> str |
 def bootstrap_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """
     Formatea el historial OpenAI convirtiendo prompts del sistema en contexto inyectado 
-    y filtrando solo los turnos que LiteRT entiende (user/assistant).
+    y adaptando turnos (user/assistant/tool) a LiteRT.
     """
     if len(messages) <= 1:
         return []
 
     history = messages[:-1]
     bootstrapped: list[dict[str, Any]] = []
-    tool_call_names = _tool_call_names_by_id(history)
 
     for msg in history:
         role = msg.get("role")
         if role in {"system", "developer"}:
             continue
 
-        tool_response_name = None
-        if role == "tool":
-            tool_call_id = msg.get("tool_call_id")
-            if isinstance(tool_call_id, str):
-                tool_response_name = tool_call_names.get(tool_call_id)
-
-        translated = translate_openai_message(
-            msg,
-            tool_response_name=tool_response_name,
-        )
+        translated = translate_openai_message(msg)
         content = translated.get("content", "")
+        trans_role = translated.get("role", role)
 
-        if role in {"user", "assistant", "tool"}:
-            bootstrapped_message = {"role": role, "content": content}
-            if "tool_calls" in translated:
-                bootstrapped_message["tool_calls"] = translated["tool_calls"]
-            bootstrapped.append(bootstrapped_message)
+        if trans_role in {"user", "assistant"}:
+            bootstrapped.append({"role": trans_role, "content": content})
 
     return bootstrapped
 
 
+def extract_chunk_content_and_thought(sdk_chunk: Any) -> tuple[str, str]:
+    """
+    Extrae de forma limpia el texto de respuesta y el texto de pensamiento (thought/reasoning).
+    Retorna (content_piece, thought_piece).
+    """
+    if sdk_chunk is None:
+        return "", ""
+
+    # 1. Si el objeto tiene atributos Message de LiteRT-LM
+    if hasattr(sdk_chunk, "channels") and isinstance(sdk_chunk.channels, dict):
+        thought = str(sdk_chunk.channels.get("thought", "") or "")
+        content = ""
+        if hasattr(sdk_chunk, "text") and sdk_chunk.text:
+            content = str(sdk_chunk.text)
+        elif hasattr(sdk_chunk, "contents") and sdk_chunk.contents:
+            content = str(sdk_chunk.contents)
+        return content, thought
+
+    # 2. Si sdk_chunk es un dict
+    if isinstance(sdk_chunk, dict):
+        thought = ""
+        if "channels" in sdk_chunk and isinstance(sdk_chunk["channels"], dict):
+            thought = str(sdk_chunk["channels"].get("thought", "") or "")
+        elif "reasoning_content" in sdk_chunk:
+            thought = str(sdk_chunk.get("reasoning_content") or "")
+
+        content = ""
+        raw_content = sdk_chunk.get("content")
+        if isinstance(raw_content, str):
+            content = raw_content
+        elif isinstance(raw_content, list):
+            content = "".join(
+                item.get("text", "") if isinstance(item, dict) else str(item)
+                for item in raw_content
+            )
+        elif isinstance(raw_content, dict) and "text" in raw_content:
+            content = str(raw_content["text"])
+
+        return content, thought
+
+    # 3. Si sdk_chunk es un string
+    if isinstance(sdk_chunk, str):
+        trimmed = sdk_chunk.strip()
+        if trimmed.startswith("{") and trimmed.endswith("}") and ("channels" in trimmed or "reasoning_content" in trimmed):
+            try:
+                data = json.loads(trimmed)
+                if isinstance(data, dict):
+                    thought = ""
+                    if "channels" in data and isinstance(data["channels"], dict):
+                        thought = str(data["channels"].get("thought", "") or "")
+                    elif "reasoning_content" in data:
+                        thought = str(data.get("reasoning_content") or "")
+
+                    content = ""
+                    raw_content = data.get("content")
+                    if isinstance(raw_content, str):
+                        content = raw_content
+                    return content, thought
+            except Exception:
+                pass
+
+        return sdk_chunk, ""
+
+    if hasattr(sdk_chunk, "text"):
+        return str(sdk_chunk.text), ""
+
+    return "", ""
+
+
 def sdk_message_to_text(message: Any) -> str:
+    """Extrae el contenido textual de una respuesta del SDK, descartando canales de razonamiento."""
+    content, _ = extract_chunk_content_and_thought(message)
+    if content:
+        return content
+
     if isinstance(message, str):
+        trimmed = message.strip()
+        if trimmed.startswith("{") and trimmed.endswith("}") and ("channels" in trimmed or "reasoning_content" in trimmed):
+            return ""
         return message
 
     if isinstance(message, dict):
-        # Si es un dict válido del SDK (tiene role, channels o content)
-        # y no hay texto, debe retornar "" (no el JSON de debug)
-        content = message.get("content")
-        if isinstance(content, str):
-            return content
-        if isinstance(content, list):
+        raw_content = message.get("content")
+        if isinstance(raw_content, str):
+            return raw_content
+        if isinstance(raw_content, list):
             parts: list[str] = []
-            for item in content:
+            for item in raw_content:
                 if isinstance(item, dict) and isinstance(item.get("text"), str):
                     parts.append(item["text"])
                 elif isinstance(item, str):
                     parts.append(item)
             return "".join(parts)
-        if isinstance(content, dict) and isinstance(content.get("text"), str):
-            return content["text"]
-            
-        # Es un chunk del SDK pero no tiene texto (ej. solo "channels" de thinking)
-        if "role" in message or "channels" in message or "reasoning_content" in message or "tool_calls" in message:
-            return ""
+        if isinstance(raw_content, dict) and isinstance(raw_content.get("text"), str):
+            return raw_content["text"]
+        return ""
 
     if hasattr(message, "text"):
         return str(message.text)
-        
-    if hasattr(message, "content"):
-        return str(message.content)
 
-    # Solo en caso de un tipo completamente desconocido (debug)
-    try:
-        return json.dumps(message, ensure_ascii=False)
-    except Exception:
-        return ""
+    return ""

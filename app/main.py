@@ -13,7 +13,8 @@ from app.conversation_manager import (
     get_conversation_manager,
     init_conversation_manager,
 )
-from app.engine import close_engine, init_engine
+from app.engine import close_engine, get_current_model_id, init_engine
+from app.model_manager import discover_models
 from app.openai_routes import router as openai_router
 from app.profile_store import get_profile_store, init_profile_store
 
@@ -47,23 +48,31 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
 
     settings = get_settings()
     logger.info("Starting LiteRT Session Server on port %s", settings.server_port)
-    logger.info("Using model profile path: %s", settings.model_profile)
+    logger.info("Models directory: %s", settings.models_dir)
+    logger.info("Default model profile: %s", settings.model_profile)
 
     await init_profile_store()
-
-    engine = await init_engine()
-    await init_conversation_manager(engine)
-    
-    # Pre-warm the profile system prompt si está habilitado
-    if settings.enable_warm_pool:
-        profile_store = get_profile_store()
-        manager = get_conversation_manager()
-        system_prompt = profile_store.combined_bootstrap_system_prompt([])
-        asyncio.create_task(manager.warm_system_prompt(system_prompt))
-    else:
-        logger.info("Warm pool desactivado por configuración (ahorro de RAM).")
-
+    await init_conversation_manager(None)
     _cleanup_task = asyncio.create_task(_cleanup_loop())
+
+    if settings.preload_first_model:
+        logger.info("PRELOAD_FIRST_MODEL is enabled. Checking models directory...")
+        try:
+            discovered = discover_models()
+            if discovered:
+                first_model_id = next(iter(discovered.keys()))
+                logger.info("Preloading model '%s' at startup...", first_model_id)
+                await init_engine(first_model_id)
+                logger.info("Model '%s' successfully preloaded at startup.", first_model_id)
+            else:
+                logger.warning("PRELOAD_FIRST_MODEL=true, but no models found in %s", settings.models_dir)
+        except Exception as exc:
+            logger.warning(
+                "Could not preload model at startup (%s). Will initialize on first request.",
+                exc,
+            )
+    else:
+        logger.info("Lazy-loading enabled: no model preloaded at startup. Initializing on first request.")
 
     try:
         yield
@@ -95,18 +104,12 @@ async def healthz() -> dict[str, str]:
 
 @app.get("/internal/profile")
 async def internal_profile() -> dict[str, object]:
-    settings = get_settings()
     profile_store = get_profile_store()
     manager = get_conversation_manager()
     stats = await manager.stats()
     return {
+        "current_model": get_current_model_id(),
         "profile": profile_store.as_debug_dict(),
-        "settings": {
-            "enable_thinking": settings.enable_thinking,
-            "enable_tool_calling": settings.enable_tool_calling,
-            "filter_thinking_from_kv_cache": settings.filter_thinking_from_kv_cache,
-            "context_rollover_threshold_tokens": settings.context_rollover_threshold_tokens,
-        },
         "active_conversations": stats["active_conversations"],
         "profile_initialized_conversations": stats["profile_initialized_conversations"],
     }

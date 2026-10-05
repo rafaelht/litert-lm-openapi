@@ -21,7 +21,10 @@ class ChatMessage(BaseModel):
     model_config = ConfigDict(extra="allow")
 
     role: str
-    content: Any
+    content: Any = ""
+    name: str | None = None
+    tool_calls: list[dict[str, Any]] | None = None
+    tool_call_id: str | None = None
 
 
 class ChatCompletionRequest(BaseModel):
@@ -32,23 +35,26 @@ class ChatCompletionRequest(BaseModel):
     stream: bool = False
 
     temperature: float | None = None
-    top_p: float | None = Field(default=None, alias="top_p")
+    top_p: float | None = None
     n: int | None = None
-    max_tokens: int | None = Field(default=None, alias="max_tokens")
+    max_tokens: int | None = None
     stop: str | list[str] | None = None
-    presence_penalty: float | None = Field(default=None, alias="presence_penalty")
-    frequency_penalty: float | None = Field(default=None, alias="frequency_penalty")
+    presence_penalty: float | None = None
+    frequency_penalty: float | None = None
     user: str | None = None
-    tools: list[dict[str, Any]] | None = None
-    tool_choice: Any | None = Field(default=None, alias="tool_choice")
-    
     reasoning_effort: str | None = None
-    enable_thinking: bool | None = None
+    thinking: bool | dict[str, Any] | None = None
+    tools: list[dict[str, Any]] | None = None
+    tool_choice: Any | None = None
 
 
 class ChatCompletionMessage(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     role: Literal["assistant"] = "assistant"
-    content: str
+    content: str | None = None
+    reasoning_content: str | None = None
+    tool_calls: list[dict[str, Any]] | None = None
 
 
 class ChatCompletionChoice(BaseModel):
@@ -58,15 +64,31 @@ class ChatCompletionChoice(BaseModel):
 
 
 class ChatCompletionUsage(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     prompt_tokens: int
     completion_tokens: int
     total_tokens: int
+    prompt_eval_count: int | None = None
+    prompt_eval_duration: int | None = None
+    eval_count: int | None = None
+    eval_duration: int | None = None
+    total_duration: int | None = None
+    load_duration: int | None = None
 
 
 class ChatCompletionResponse(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     id: str
     object: Literal["chat.completion"] = "chat.completion"
     created: int
     model: str
     choices: list[ChatCompletionChoice]
     usage: ChatCompletionUsage
+    prompt_eval_count: int | None = None
+    prompt_eval_duration: int | None = None
+    eval_count: int | None = None
+    eval_duration: int | None = None
+    total_duration: int | None = None
+    load_duration: int | None = None
