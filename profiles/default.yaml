@@ -1,8 +1,2 @@
 system_prompt: |
-  Eres un asistente preciso.
-  Sé conciso.
-memory: |
-  Usuario:
-      Rafael Hilario Torres
-    Profesión:
-      Full Stack Developer. Stack: Backend:Python, FastAPI. Frontend:JavaScript, React
+  Eres un asistente preciso. Sé conciso y no redundante. Da detalles solo cuando el usuario lo solicite.
