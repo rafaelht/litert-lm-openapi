@@ -140,21 +140,45 @@ def detect_admin_request(
     """Determina si la petición entrante es una solicitud de metadatos de OpenWebUI (Título o Tags)."""
     msg_lower = incremental_message.lower()
 
+    # Detección estricta de solicitud de tags de OpenWebUI
     is_tags = (
         "generate 1-3 broad tags" in msg_lower
         or "tags for this conversation" in msg_lower
-        or (len(message_dicts) == 1 and "tags" in msg_lower and (max_tokens is None or max_tokens <= 32))
+        or "categorize this conversation" in msg_lower
+        or (
+            len(message_dicts) == 1
+            and max_tokens is not None
+            and max_tokens <= 32
+            and bool(re.search(r"\b(tags?|etiquetas?)\b", msg_lower))
+        )
     )
     if is_tags:
         return True, "tags"
 
-    is_title = (
-        "title" in msg_lower
+    # Detección estricta de prompts de titulación de OpenWebUI sin falsos positivos en código/HTML
+    openwebui_title_prompts = (
+        "generate a title" in msg_lower
+        or "create a title" in msg_lower
+        or "generate a concise" in msg_lower
+        or "title for the conversation" in msg_lower
+        or "title for this chat" in msg_lower
+        or "title of the conversation" in msg_lower
         or "creative title" in msg_lower
         or "phrase with an emoji" in msg_lower
-        or (max_tokens is not None and max_tokens <= 24)
+        or "short title summarizing" in msg_lower
+        or 'format: {"title":' in msg_lower
     )
-    if is_title:
+
+    # Restringir heurística de max_tokens solo a prompts cortos típicos de tareas de sistema
+    is_short_title_prompt = (
+        len(message_dicts) == 1
+        and len(incremental_message) < 500
+        and max_tokens is not None
+        and max_tokens <= 24
+        and bool(re.search(r"\b(title|título)\b", msg_lower))
+    )
+
+    if openwebui_title_prompts or is_short_title_prompt:
         return True, "title"
 
     return False, ""
